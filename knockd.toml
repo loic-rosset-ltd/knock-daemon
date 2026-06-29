@@ -1,0 +1,33 @@
+# Example knock-daemon configuration.
+#
+# Run a sanity check without root or libpcap:
+#   knockd2 --check --config knockd.toml
+#
+# See the concurrency story without any setup:
+#   knockd2 --demo
+
+# Interface to capture on. Omit for the capture layer's default device.
+interface = "eth0"
+
+[firewall]
+# "command" — run open_command/close_command with %IP% substituted (knockd-style).
+# "nftables" — manipulate an allow-set element directly (planned; not yet implemented).
+backend = "command"
+
+# A door: an ordered port sequence that, completed in time, opens access.
+# Steps are "<port>/<tcp|udp>"; a bare number defaults to tcp.
+[[door]]
+name = "ssh"
+sequence = ["7000/tcp", "8000/udp", "9000/tcp"]
+seq_timeout = "10s"                # whole sequence must complete within this window
+open_command = "nft add element inet filter knock_clients { %IP% }"
+close_command = "nft delete element inet filter knock_clients { %IP% }"
+cmd_timeout = "30s"                # auto-run close_command this long after opening
+
+# Doors may overlap (share a prefix) and run concurrently across clients;
+# the daemon tracks each source IP independently.
+[[door]]
+name = "https-admin"
+sequence = ["7000/tcp", "8500/tcp", "9100/tcp"]
+seq_timeout = "10s"
+open_command = "nft add element inet filter admin_clients { %IP% }"

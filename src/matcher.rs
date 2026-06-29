@@ -1,0 +1,241 @@
+//! Concurrent sequence matcher — the core of knock-daemon and its main point of
+//! difference from classic `knockd`.
+//!
+//! `knockd` walks packets through a single global set of door state machines and
+//! gets confused when several clients knock at once, or when doors share ports.
+//! Here, in-flight progress is partitioned **per source IP**, and within an IP we
+//! track an independent attempt for every door. Because each source is isolated,
+//! simultaneous sequences from different clients never interfere, and overlapping
+//! doors (sharing a prefix) both advance from the same packet.
+//!
+//! The matcher is deliberately pure: it takes a logical millisecond timestamp on
+//! each event rather than reading the clock, so its behaviour is fully
+//! deterministic and unit-testable without real packets or sleeps.
+
+use std::collections::HashMap;
+use std::net::IpAddr;
+
+/// Transport protocol a knock step is sent over.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum Proto {
+    Tcp,
+    Udp,
+}
+
+/// A single expected hit in a door's sequence: a port on a given protocol.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct PortSpec {
+    pub port: u16,
+    pub proto: Proto,
+}
+
+/// A door: an ordered port sequence that, when completed in time, fires an action.
+#[derive(Clone, Debug)]
+pub struct DoorSpec {
+    pub name: String,
+    pub sequence: Vec<PortSpec>,
+    /// Maximum wall-clock time (ms) from the first hit to the last for the whole
+    /// sequence to count. Mirrors knockd's `seq_timeout`.
+    pub seq_timeout_ms: u64,
+}
+
+/// An observed packet relevant to knocking, normalised by the capture layer.
+#[derive(Clone, Copy, Debug)]
+pub struct PacketEvent {
+    pub src: IpAddr,
+    pub port: u16,
+    pub proto: Proto,
+    /// Monotonic logical timestamp in milliseconds.
+    pub at_ms: u64,
+}
+
+/// A completed door for a given source IP, emitted by [`Matcher::process`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Completed {
+    pub door: usize,
+    pub src: IpAddr,
+}
+
+/// One in-flight attempt at a single door from a single source IP.
+#[derive(Clone, Copy, Debug)]
+struct Attempt {
+    door: usize,
+    /// Index of the next expected step in the door's sequence.
+    stage: usize,
+    started_ms: u64,
+}
+
+/// Per-IP attempt cap. A misbehaving or hostile source can otherwise spawn an
+/// unbounded number of partial attempts (one per packet to any door's first
+/// port). Bounding state per source keeps the daemon's memory predictable; the
+/// oldest attempts are dropped first.
+const MAX_ATTEMPTS_PER_IP: usize = 256;
+
+pub struct Matcher {
+    doors: Vec<DoorSpec>,
+    inflight: HashMap<IpAddr, Vec<Attempt>>,
+}
+
+impl Matcher {
+    pub fn new(doors: Vec<DoorSpec>) -> Self {
+        Self {
+            doors,
+            inflight: HashMap::new(),
+        }
+    }
+
+    /// Number of source IPs with at least one in-flight attempt. Exposed for
+    /// observability and tests.
+    #[allow(dead_code)] // consumed by tests today; reserved for a future stats endpoint
+    pub fn tracked_sources(&self) -> usize {
+        self.inflight.len()
+    }
+
+    /// Feed one observed packet. Returns every door that this packet completed
+    /// for the packet's source IP (usually zero, occasionally one, rarely more
+    /// when overlapping doors finish on the same hit).
+    pub fn process(&mut self, ev: PacketEvent) -> Vec<Completed> {
+        // Split the borrow: `doors` is read-only while we mutate one IP's bucket.
+        let doors = &self.doors;
+        let entry = self.inflight.entry(ev.src).or_default();
+
+        // 1. Reap attempts whose whole-sequence timeout has elapsed.
+        entry.retain(|a| ev.at_ms.saturating_sub(a.started_ms) <= doors[a.door].seq_timeout_ms);
+
+        let mut completed = Vec::new();
+
+        // 2. Advance existing attempts whose next expected step matches this hit.
+        let mut i = 0;
+        while i < entry.len() {
+            let a = &mut entry[i];
+            let expected = doors[a.door].sequence[a.stage];
+            if expected.port == ev.port && expected.proto == ev.proto {
+                a.stage += 1;
+                if a.stage == doors[a.door].sequence.len() {
+                    completed.push(Completed { door: a.door, src: ev.src });
+                    entry.remove(i);
+                    continue; // don't advance `i`; the next element shifted down
+                }
+            }
+            i += 1;
+        }
+
+        // 3. Open a fresh attempt for every door whose first step matches. This
+        //    is what lets retries and interleaved sequences coexist: a stray hit
+        //    to a door's opening port starts a new candidate rather than
+        //    corrupting an in-flight one.
+        for (di, d) in doors.iter().enumerate() {
+            match d.sequence.first() {
+                Some(p) if p.port == ev.port && p.proto == ev.proto => {
+                    if d.sequence.len() == 1 {
+                        // Single-step door completes immediately.
+                        completed.push(Completed { door: di, src: ev.src });
+                    } else {
+                        entry.push(Attempt { door: di, stage: 1, started_ms: ev.at_ms });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 4. Bound per-IP state; drop the oldest attempts beyond the cap.
+        if entry.len() > MAX_ATTEMPTS_PER_IP {
+            let overflow = entry.len() - MAX_ATTEMPTS_PER_IP;
+            entry.drain(0..overflow);
+        }
+
+        if entry.is_empty() {
+            self.inflight.remove(&ev.src);
+        }
+
+        completed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn ip(n: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, n))
+    }
+
+    fn tcp(port: u16) -> PortSpec {
+        PortSpec { port, proto: Proto::Tcp }
+    }
+
+    fn door(name: &str, ports: &[u16], timeout: u64) -> DoorSpec {
+        DoorSpec {
+            name: name.into(),
+            sequence: ports.iter().map(|&p| tcp(p)).collect(),
+            seq_timeout_ms: timeout,
+        }
+    }
+
+    fn ev(src: IpAddr, port: u16, at_ms: u64) -> PacketEvent {
+        PacketEvent { src, port, proto: Proto::Tcp, at_ms }
+    }
+
+    #[test]
+    fn completes_a_simple_sequence() {
+        let mut m = Matcher::new(vec![door("ssh", &[7000, 8000, 9000], 10_000)]);
+        assert!(m.process(ev(ip(1), 7000, 0)).is_empty());
+        assert!(m.process(ev(ip(1), 8000, 100)).is_empty());
+        let done = m.process(ev(ip(1), 9000, 200));
+        assert_eq!(done, vec![Completed { door: 0, src: ip(1) }]);
+        // State is cleaned up once the door fires.
+        assert_eq!(m.tracked_sources(), 0);
+    }
+
+    #[test]
+    fn wrong_port_does_not_reset_but_timeout_does() {
+        let mut m = Matcher::new(vec![door("ssh", &[7000, 8000, 9000], 10_000)]);
+        m.process(ev(ip(1), 7000, 0));
+        // Noise to an unrelated port is ignored; the attempt survives.
+        m.process(ev(ip(1), 1234, 50));
+        m.process(ev(ip(1), 8000, 100));
+        assert_eq!(m.process(ev(ip(1), 9000, 200)), vec![Completed { door: 0, src: ip(1) }]);
+    }
+
+    #[test]
+    fn sequence_expires_after_timeout() {
+        let mut m = Matcher::new(vec![door("ssh", &[7000, 8000, 9000], 1_000)]);
+        m.process(ev(ip(1), 7000, 0));
+        m.process(ev(ip(1), 8000, 500));
+        // Final hit arrives after seq_timeout from the first hit → no match.
+        assert!(m.process(ev(ip(1), 9000, 1_500)).is_empty());
+    }
+
+    #[test]
+    fn concurrent_sources_do_not_interfere() {
+        // The defining knockd failure: two clients knocking the same door at the
+        // same time, fully interleaved. Both must succeed independently.
+        let mut m = Matcher::new(vec![door("ssh", &[7000, 8000, 9000], 10_000)]);
+        m.process(ev(ip(1), 7000, 0));
+        m.process(ev(ip(2), 7000, 10));
+        m.process(ev(ip(2), 8000, 20));
+        m.process(ev(ip(1), 8000, 30));
+        assert_eq!(m.process(ev(ip(1), 9000, 40)), vec![Completed { door: 0, src: ip(1) }]);
+        assert_eq!(m.process(ev(ip(2), 9000, 50)), vec![Completed { door: 0, src: ip(2) }]);
+    }
+
+    #[test]
+    fn overlapping_doors_both_advance() {
+        // Two doors sharing a prefix; one packet drives both candidates forward.
+        let mut m = Matcher::new(vec![
+            door("a", &[7000, 8000], 10_000),
+            door("b", &[7000, 9000], 10_000),
+        ]);
+        m.process(ev(ip(1), 7000, 0));
+        assert_eq!(m.process(ev(ip(1), 8000, 10)), vec![Completed { door: 0, src: ip(1) }]);
+        assert_eq!(m.process(ev(ip(1), 9000, 20)), vec![Completed { door: 1, src: ip(1) }]);
+    }
+
+    #[test]
+    fn single_step_door_fires_immediately() {
+        let mut m = Matcher::new(vec![door("ping", &[12345], 1_000)]);
+        assert_eq!(m.process(ev(ip(1), 12345, 0)), vec![Completed { door: 0, src: ip(1) }]);
+        assert_eq!(m.tracked_sources(), 0);
+    }
+}

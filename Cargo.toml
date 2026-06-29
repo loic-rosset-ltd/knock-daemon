@@ -1,0 +1,34 @@
+[package]
+name = "knock-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Concurrent port-knocking daemon — a knockd replacement that handles many simultaneous knock sequences without cross-talk."
+license = "UNLICENSED"
+publish = false
+
+[[bin]]
+name = "knockd2"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Live packet capture via libpcap. Off by default so the crate builds and
+# tests run on machines without libpcap headers; the matcher core is pure.
+pcap = { version = "2", optional = true }
+
+[features]
+default = []
+# Enable the libpcap-backed live capture path (requires libpcap-dev / libpcap).
+capture-pcap = ["dep:pcap"]
+
+[profile.release]
+lto = true
+strip = true
+panic = "abort"
