@@ -8,6 +8,7 @@
 mod capture;
 mod config;
 mod firewall;
+mod knockd;
 mod matcher;
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -21,10 +22,14 @@ use clap::Parser;
 
 use capture::{Capture, ReplayCapture};
 use config::{Config, ResolvedDoor};
-use matcher::{Matcher, PacketEvent, Proto};
+use matcher::{MatchMode, Matcher, PacketEvent, Proto};
 
 #[derive(Parser, Debug)]
-#[command(name = "knockd2", version, about = "Concurrent port-knocking daemon (knockd replacement)")]
+#[command(
+    name = "knockd2",
+    version,
+    about = "Concurrent port-knocking daemon (knockd replacement)"
+)]
 struct Cli {
     /// Path to the TOML config file.
     #[arg(short, long, default_value = "knockd.toml")]
@@ -56,42 +61,54 @@ fn main() -> Result<()> {
 
     let raw = std::fs::read_to_string(&cli.config)
         .with_context(|| format!("reading config {}", cli.config.display()))?;
-    let cfg: Config = toml::from_str(&raw).context("parsing config TOML")?;
+    // knockd `.conf` files use the legacy INI format; everything else is our TOML.
+    let cfg: Config = if cli.config.extension().and_then(|e| e.to_str()) == Some("conf") {
+        knockd::parse_conf(&raw).context("parsing knockd .conf")?
+    } else {
+        toml::from_str(&raw).context("parsing config TOML")?
+    };
     let fw_kind = cfg.firewall_kind()?;
+    let mode = cfg.match_mode()?;
     let doors = cfg.resolve(fw_kind).context("validating config")?;
 
     if cli.check {
         let iface = cfg.interface.as_deref().unwrap_or("<capture default>");
-        println!("config OK: interface = {iface}, {} door(s), firewall backend = {:?}", doors.len(), fw_kind);
+        println!(
+            "config OK: interface = {iface}, {} door(s), firewall backend = {:?}, matching = {:?}",
+            doors.len(),
+            fw_kind,
+            mode
+        );
         for d in &doors {
-            println!("  - {} ({} steps, seq_timeout {}ms)", d.spec.name, d.spec.sequence.len(), d.spec.seq_timeout_ms);
+            println!(
+                "  - {} ({} steps, seq_timeout {}ms)",
+                d.spec.name,
+                d.spec.sequence.len(),
+                d.spec.seq_timeout_ms
+            );
         }
         return Ok(());
     }
 
-    run_live(cfg, doors, fw_kind)
+    run_live(cfg, doors, fw_kind, mode)
 }
 
-/// Drive the capture → matcher → firewall pipeline against live traffic.
-#[cfg(feature = "capture-pcap")]
-fn run_live(cfg: Config, doors: Vec<ResolvedDoor>, fw_kind: firewall::FirewallKind) -> Result<()> {
+/// Drive the capture → matcher → firewall pipeline against live traffic, using
+/// whichever capture backend this binary was built with.
+fn run_live(
+    cfg: Config,
+    doors: Vec<ResolvedDoor>,
+    fw_kind: firewall::FirewallKind,
+    mode: MatchMode,
+) -> Result<()> {
     let ports: Vec<u16> = doors
         .iter()
         .flat_map(|d| d.spec.sequence.iter().map(|p| p.port))
         .collect();
-    let mut cap = capture::PcapCapture::new(cfg.interface.clone(), &ports);
-    let engine = Engine::new(doors, fw_kind)?;
+    let mut cap = capture::open_live(cfg.interface.clone(), &ports)?;
+    let mut engine = Engine::new(doors, fw_kind, mode)?;
     tracing::info!("knock-daemon up; capturing live traffic");
-    run_pipeline(&mut cap, engine)
-}
-
-#[cfg(not(feature = "capture-pcap"))]
-fn run_live(_cfg: Config, _doors: Vec<ResolvedDoor>, _fw_kind: firewall::FirewallKind) -> Result<()> {
-    anyhow::bail!(
-        "live capture requires the `capture-pcap` feature.\n\
-         Rebuild with: cargo build --release --features capture-pcap\n\
-         (or run `--demo` / `--check`, which need no capture backend)"
-    )
+    cap.run(&mut |ev| engine.on_packet(ev))
 }
 
 /// The matching + action half of the pipeline, independent of the capture source.
@@ -104,10 +121,18 @@ struct Engine {
 // CommandFirewall is stateless; mark the trait-object usage Sync-safe via Arc.
 // (Box<dyn Firewall> is Send; we wrap in Arc and require Sync at construction.)
 impl Engine {
-    fn new(doors: Vec<ResolvedDoor>, fw_kind: firewall::FirewallKind) -> Result<Self> {
+    fn new(
+        doors: Vec<ResolvedDoor>,
+        fw_kind: firewall::FirewallKind,
+        mode: MatchMode,
+    ) -> Result<Self> {
         let specs = doors.iter().map(|d| d.spec.clone()).collect();
         let firewall = firewall_arc(fw_kind)?;
-        Ok(Self { matcher: Matcher::new(specs), doors, firewall })
+        Ok(Self {
+            matcher: Matcher::with_mode(specs, mode),
+            doors,
+            firewall,
+        })
     }
 
     /// Feed one packet; run actions for any completed doors.
@@ -138,11 +163,7 @@ fn firewall_arc(kind: firewall::FirewallKind) -> Result<Arc<dyn firewall::Firewa
 
 /// If the door has a `cmd_timeout` and a `close_command`, spawn a timer that
 /// runs the close action after the delay.
-fn schedule_close(
-    firewall: Arc<dyn firewall::Firewall + Sync>,
-    door: &ResolvedDoor,
-    src: IpAddr,
-) {
+fn schedule_close(firewall: Arc<dyn firewall::Firewall + Sync>, door: &ResolvedDoor, src: IpAddr) {
     let (Some(timeout_ms), true) = (door.action.timeout_ms, door.action.close_command.is_some())
     else {
         return;
@@ -158,11 +179,6 @@ fn schedule_close(
     });
 }
 
-#[cfg(feature = "capture-pcap")]
-fn run_pipeline(cap: &mut dyn Capture, mut engine: Engine) -> Result<()> {
-    cap.run(&mut |ev| engine.on_packet(ev))
-}
-
 /// Replay a canned, interleaved scenario so the concurrency story is visible
 /// without root or libpcap.
 fn run_demo() -> Result<()> {
@@ -170,16 +186,30 @@ fn run_demo() -> Result<()> {
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, n))
     }
     fn tcp(src: IpAddr, port: u16, at_ms: u64) -> PacketEvent {
-        PacketEvent { src, port, proto: Proto::Tcp, at_ms }
+        PacketEvent {
+            src,
+            port,
+            proto: Proto::Tcp,
+            at_ms,
+        }
     }
 
     let doors = vec![ResolvedDoor {
         spec: matcher::DoorSpec {
             name: "ssh".into(),
             sequence: vec![
-                matcher::PortSpec { port: 7000, proto: Proto::Tcp },
-                matcher::PortSpec { port: 8000, proto: Proto::Tcp },
-                matcher::PortSpec { port: 9000, proto: Proto::Tcp },
+                matcher::PortSpec {
+                    port: 7000,
+                    proto: Proto::Tcp,
+                },
+                matcher::PortSpec {
+                    port: 8000,
+                    proto: Proto::Tcp,
+                },
+                matcher::PortSpec {
+                    port: 9000,
+                    proto: Proto::Tcp,
+                },
             ],
             seq_timeout_ms: 10_000,
         },
@@ -200,7 +230,7 @@ fn run_demo() -> Result<()> {
         tcp(ip(10), 9000, 31), // .10 completes too
     ];
 
-    let mut engine = Engine::new(doors, firewall::FirewallKind::Command)?;
+    let mut engine = Engine::new(doors, firewall::FirewallKind::Command, MatchMode::Tolerant)?;
     let mut cap = ReplayCapture::new(events);
     println!("--- knock-daemon demo: two interleaved clients knocking the same door ---");
     cap.run(&mut |ev| engine.on_packet(ev))?;

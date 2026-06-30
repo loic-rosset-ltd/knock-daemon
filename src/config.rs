@@ -1,13 +1,14 @@
 //! TOML configuration and conversion into runtime types.
 //!
-//! A knockd-compatible `.conf` parser is planned (see DESIGN.md); for now the
-//! native format is TOML, which maps cleanly onto serde.
+//! This is the native format (TOML, mapped onto serde). The legacy knockd
+//! `.conf` format is handled by [`crate::knockd`], which lowers onto the same
+//! [`Config`]/[`DoorConfig`] types resolved here.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::firewall::{Action, FirewallKind, NftSet};
-use crate::matcher::{DoorSpec, PortSpec, Proto};
+use crate::matcher::{DoorSpec, MatchMode, PortSpec, Proto};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -15,8 +16,29 @@ pub struct Config {
     pub interface: Option<String>,
     #[serde(default)]
     pub firewall: FirewallConfig,
+    #[serde(default)]
+    pub matching: MatchingConfig,
     #[serde(rename = "door", default)]
     pub doors: Vec<DoorConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MatchingConfig {
+    /// "tolerant" (default) or "reset" (knockd parity). See [`MatchMode`].
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_mode() -> String {
+    "tolerant".to_string()
+}
+
+impl Default for MatchingConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_mode(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -68,7 +90,17 @@ impl Config {
         match self.firewall.backend.as_str() {
             "command" => Ok(FirewallKind::Command),
             "nftables" => Ok(FirewallKind::Nftables),
-            other => bail!("unknown firewall backend {other:?} (expected \"command\" or \"nftables\")"),
+            other => {
+                bail!("unknown firewall backend {other:?} (expected \"command\" or \"nftables\")")
+            }
+        }
+    }
+
+    pub fn match_mode(&self) -> Result<MatchMode> {
+        match self.matching.mode.as_str() {
+            "tolerant" => Ok(MatchMode::Tolerant),
+            "reset" | "strict" => Ok(MatchMode::Reset),
+            other => bail!("unknown matching mode {other:?} (expected \"tolerant\" or \"reset\")"),
         }
     }
 
@@ -111,7 +143,10 @@ impl DoorConfig {
         // Backend-specific requirements: a door must carry what its backend acts on.
         match kind {
             FirewallKind::Command if self.open_command.is_none() => {
-                bail!("door {:?}: command backend requires open_command", self.name)
+                bail!(
+                    "door {:?}: command backend requires open_command",
+                    self.name
+                )
             }
             FirewallKind::Nftables if nft_set.is_none() => {
                 bail!("door {:?}: nftables backend requires nft_set", self.name)
@@ -179,9 +214,27 @@ mod tests {
 
     #[test]
     fn parses_port_specs() {
-        assert_eq!(parse_port_spec("7000").unwrap(), PortSpec { port: 7000, proto: Proto::Tcp });
-        assert_eq!(parse_port_spec("80/tcp").unwrap(), PortSpec { port: 80, proto: Proto::Tcp });
-        assert_eq!(parse_port_spec("53/udp").unwrap(), PortSpec { port: 53, proto: Proto::Udp });
+        assert_eq!(
+            parse_port_spec("7000").unwrap(),
+            PortSpec {
+                port: 7000,
+                proto: Proto::Tcp
+            }
+        );
+        assert_eq!(
+            parse_port_spec("80/tcp").unwrap(),
+            PortSpec {
+                port: 80,
+                proto: Proto::Tcp
+            }
+        );
+        assert_eq!(
+            parse_port_spec("53/udp").unwrap(),
+            PortSpec {
+                port: 53,
+                proto: Proto::Udp
+            }
+        );
         assert!(parse_port_spec("0").is_err());
         assert!(parse_port_spec("99/sctp").is_err());
     }

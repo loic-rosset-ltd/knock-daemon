@@ -15,10 +15,14 @@ front-end; this daemon is the server side it knocks against.
 
 ## Status
 
-Early scaffold. The **concurrent matcher is real and unit-tested**; live capture
-(libpcap) and both firewall backends — `command` and `nftables` (allow-set
-element with a kernel-side timeout) — are wired up. A pure-Rust capture path and
-knockd `.conf` compatibility are on the roadmap — see [DESIGN.md](DESIGN.md).
+The **concurrent matcher is real and unit-tested**. Live capture has two
+backends — a pure-Rust `AF_PACKET` path (`capture-afpacket`, no libpcap) and a
+libpcap path (`capture-pcap`) — sharing a unit-tested frame decoder
+(IPv4/IPv6/VLAN/QinQ). Both firewall backends ship: `command` (knockd-style) and
+`nftables` (allow-set element with a kernel-side timeout). Classic knockd
+`.conf` files are parsed for drop-in migration, and a systemd unit runs the
+daemon with `CAP_NET_RAW`/`CAP_NET_ADMIN` instead of root. See
+[DESIGN.md](DESIGN.md) for the architecture and roadmap.
 
 ## Try it (no root, no libpcap)
 
@@ -37,15 +41,21 @@ cargo run -- --check --config knockd.toml
 
 ## Run against live traffic
 
-Live capture is behind the `capture-pcap` feature (needs libpcap):
+Live capture is behind a feature flag — pick a backend at build time:
 
 ```sh
-# Debian/Ubuntu: apt install libpcap-dev
+# Pure-Rust AF_PACKET (Linux, no libpcap dependency) — recommended:
+cargo build --release --features capture-afpacket
+
+# …or libpcap-backed (Debian/Ubuntu: apt install libpcap-dev):
 cargo build --release --features capture-pcap
+
 sudo ./target/release/knockd2 --config /etc/knock-daemon/knockd.toml
 ```
 
-Capture needs `CAP_NET_RAW`; the nftables backend needs `CAP_NET_ADMIN`.
+If both features are built in, the AF_PACKET backend is preferred. Capture needs
+`CAP_NET_RAW`; the nftables backend needs `CAP_NET_ADMIN` — see
+[Run as a service](#run-as-a-service) to grant just those instead of root.
 
 ## Configuration
 
@@ -85,11 +95,47 @@ cmd_timeout = "30s"                       # kernel-side element timeout
 The set must already exist with a timeout flag, e.g.
 `nft add set inet filter knock_clients '{ type ipv4_addr; flags timeout; }'`.
 
+### Matching mode
+
+By default an out-of-order packet to an **unrelated** port never derails an
+in-flight sequence — correctness leans on `seq_timeout`, which is robust to
+background noise and concurrent traffic. Set `[matching] mode = "reset"` for
+classic knockd parity, where a hit to one of a door's own ports out of order
+aborts the attempt:
+
+```toml
+[matching]
+mode = "tolerant"   # default; or "reset" for knockd-style reset-on-stray
+```
+
+## Migrating from knockd
+
+Point `--config` at an existing knockd `.conf` and it's parsed in place (the
+`.conf` extension selects the legacy format; anything else is TOML):
+
+```sh
+knockd2 --check --config /etc/knockd.conf
+```
+
+knockd's `command` / `start_command` / `stop_command` / `cmd_timeout` map onto
+the `command` firewall backend, `port:proto` steps become `port/proto`, and the
+matcher defaults to `reset` mode to mirror knockd's behaviour. See
+[`examples/knockd.conf`](examples/knockd.conf).
+
+## Run as a service
+
+[`packaging/systemd/knockd2.service`](packaging/systemd/knockd2.service) runs the
+daemon under a `DynamicUser` with only `CAP_NET_RAW` (capture) and
+`CAP_NET_ADMIN` (firewall) — no root — plus a hardening sandbox. See
+[`packaging/README.md`](packaging/README.md) for install and verification steps.
+
 ## Development
 
 ```sh
-cargo test                          # pure matcher + config tests, no privileges needed
-cargo check --features capture-pcap # type-check the live capture path
+cargo test                              # matcher, frame parser, config + knockd tests
+cargo check --features capture-pcap     # type-check the libpcap path
+# The AF_PACKET backend is Linux-only; type-check it from any host with:
+cargo check --target x86_64-unknown-linux-gnu --features capture-afpacket
 ```
 
 The matcher (`src/matcher.rs`) takes a logical timestamp per event instead of

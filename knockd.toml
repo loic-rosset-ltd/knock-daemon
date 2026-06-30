@@ -15,6 +15,15 @@ interface = "eth0"
 #              (each door needs `nft_set`; `cmd_timeout` becomes the element timeout).
 backend = "command"
 
+[matching]
+# How an out-of-order hit to one of a door's own ports is treated:
+#   "tolerant" (default) — a stray hit never derails an in-flight sequence;
+#                          correctness leans on seq_timeout. Robust to noise and
+#                          concurrent traffic.
+#   "reset"              — knockd parity: a monitored-but-out-of-order hit aborts
+#                          the attempt (the classic reset-on-stray behaviour).
+mode = "tolerant"
+
 # A door: an ordered port sequence that, completed in time, opens access.
 # Steps are "<port>/<tcp|udp>"; a bare number defaults to tcp.
 [[door]]

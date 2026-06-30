@@ -53,10 +53,14 @@ For each observed packet `(src, port, proto, t)`:
 4. Bound per-IP state at `MAX_ATTEMPTS_PER_IP` (drop oldest) so a hostile source
    can't grow daemon memory without limit.
 
-Deliberate choice: an out-of-sequence packet to an **unrelated** port does *not*
-reset progress; correctness leans on `seq_timeout` instead. This is more robust to
-background noise and concurrent traffic than knockd's reset-on-stray behaviour.
-A configurable strict/reset mode is a planned option for knockd parity.
+Deliberate choice (the default **tolerant** mode): an out-of-sequence packet to
+an **unrelated** port does *not* reset progress; correctness leans on
+`seq_timeout` instead. This is more robust to background noise and concurrent
+traffic than knockd's reset-on-stray behaviour. A **reset** mode is selectable
+(`[matching] mode = "reset"`, the default for parsed knockd `.conf` files) for
+knockd parity: there, a hit to one of a door's *own* sequence ports that isn't
+the expected next step aborts that attempt, and a fresh hit to the first step
+restarts it.
 
 ## Architecture
 
@@ -65,15 +69,22 @@ A configurable strict/reset mode is a planned option for knockd parity.
   NIC → │ Capture  │ ───────────────▶ │  Matcher  │ ─────────────▶ │  Firewall  │
         │ (trait)  │  src,port,proto  │ (per-IP)  │   door, src    │  (trait)   │
         └──────────┘                  └───────────┘                └────────────┘
-         pcap | replay                  pure core                  command | nftables
+      afpacket | pcap | replay          pure core                  command | nftables
 ```
 
-- **`capture/`** — `Capture` trait yielding normalised `PacketEvent`s.
+- **`capture/`** — `Capture` trait yielding normalised `PacketEvent`s. Frame
+  decoding (Ethernet, 802.1Q/802.1ad VLAN incl. stacked QinQ, IPv4, IPv6 with a
+  bounded extension-header walk, TCP-SYN, UDP) lives in the pure `capture::parse`
+  module and is fully unit-tested against hand-built frames — every live backend
+  shares it.
+  - `afpacket` backend (feature `capture-afpacket`, Linux): pure-Rust `AF_PACKET`
+    `SOCK_RAW` socket via `libc`, **no libpcap C dependency**. Relevance
+    filtering is done in userspace against the door port set (a kernel cBPF
+    prefilter is a future optimisation). Preferred live backend when built in.
   - `pcap` backend (feature `capture-pcap`): libpcap + a kernel-side BPF filter
-    built from the union of door ports; emits one event per inbound TCP SYN and
-    per UDP datagram. *Planned:* pure-Rust `AF_PACKET`/eBPF backend to drop the
-    libpcap C dependency, plus IPv6 and VLAN handling.
+    built from the union of door ports.
   - `replay` backend: deterministic, used by `--demo` and tests.
+  - `capture::open_live` picks the best backend compiled in (afpacket > pcap).
 - **`matcher.rs`** — the concurrent core described above.
 - **`firewall/`** — `Firewall` trait with open/close side effects. The runtime
   hands each backend a per-door `Action` (open/close commands, nft set, timeout),
@@ -87,8 +98,12 @@ A configurable strict/reset mode is a planned option for knockd parity.
     on its own, so the backend reports `auto_expires()` and the runtime skips the
     userspace close timer. (The argv builders are pure and unit-tested without
     `nft` present.)
-- **`config.rs`** — TOML config → validated runtime doors. A knockd-`.conf`
-  compatibility parser is planned to ease migration.
+- **`config.rs`** — native TOML config → validated runtime doors, plus the
+  firewall-backend and matching-mode selectors.
+- **`knockd.rs`** — compatibility parser for classic knockd `.conf` files,
+  lowering them onto the same `Config`. Selected automatically by the `.conf`
+  extension, so an existing knockd deployment migrates by pointing `--config` at
+  its current file.
 - **`main.rs`** — CLI (`--config`, `--check`, `--demo`), logging, and the
   capture→match→act wiring, including `cmd_timeout` auto-close timers.
 
@@ -112,18 +127,28 @@ A configurable strict/reset mode is a planned option for knockd parity.
    capture (feature-gated), command firewall, `--demo`/`--check`.
 2. ~~nftables firewall backend (allow-set element + kernel timeout).~~ **Done** —
    `nft_set` per door, kernel-side element timeout, no userspace close timer.
-3. Pure-Rust `AF_PACKET`/eBPF capture; IPv6 + VLAN.
-4. knockd `.conf` compatibility parser; strict/reset matching mode.
+3. ~~Pure-Rust `AF_PACKET` capture; IPv6 + VLAN.~~ **Done** — `capture-afpacket`
+   backend (libc, no libpcap), shared `capture::parse` decoder handling
+   IPv4/IPv6/VLAN/QinQ. (Kernel cBPF prefilter for AF_PACKET still open.)
+4. ~~knockd `.conf` compatibility parser; strict/reset matching mode.~~ **Done** —
+   `knockd.rs` parser (auto-selected by extension) + `MatchMode::{Tolerant,Reset}`.
 5. Sharded multi-worker matching; per-source rate limiting; a stats/observability
    endpoint.
-6. systemd unit + capability-based privilege (CAP_NET_RAW + CAP_NET_ADMIN) instead
-   of full root.
+6. ~~systemd unit + capability-based privilege (CAP_NET_RAW + CAP_NET_ADMIN)
+   instead of full root.~~ **Done** — `packaging/systemd/knockd2.service`
+   (DynamicUser + AmbientCapabilities + hardening). Next: a kernel cBPF prefilter
+   (item 3) and the sharded matcher (item 5).
 
 ## Privileges & threat model
 
 Live capture needs `CAP_NET_RAW`; the nftables backend needs `CAP_NET_ADMIN`. The
-daemon observes opening packets only and never terminates connections, so it can't
-be tricked into dropping traffic. Per-IP state is bounded (`MAX_ATTEMPTS_PER_IP`)
-to blunt state-exhaustion attempts; per-source rate limiting is on the roadmap.
+daemon runs with exactly those two capabilities and no more — the shipped systemd
+unit (`packaging/systemd/knockd2.service`) uses a `DynamicUser` plus
+`AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN` and a hardening sandbox instead of
+running as root; the ambient grant is inherited by any `nft`/`iptables` child the
+command backend execs. The daemon observes opening packets only and never
+terminates connections, so it can't be tricked into dropping traffic. Per-IP
+state is bounded (`MAX_ATTEMPTS_PER_IP`) to blunt state-exhaustion attempts;
+per-source rate limiting is on the roadmap.
 Knock secrecy is the usual port-knocking model — the sequence is the secret;
 combine with `seq_timeout` and short `cmd_timeout` windows to limit replay value.

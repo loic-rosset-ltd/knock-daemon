@@ -22,6 +22,18 @@ pub enum Proto {
     Udp,
 }
 
+/// How the matcher treats an out-of-order hit to a port the door cares about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum MatchMode {
+    /// Default: a stray hit never derails an in-flight attempt; correctness
+    /// leans on `seq_timeout`. More robust to background noise and concurrency.
+    #[default]
+    Tolerant,
+    /// knockd parity: a hit to one of the door's own sequence ports that isn't
+    /// the next expected step aborts that attempt (the classic reset-on-stray).
+    Reset,
+}
+
 /// A single expected hit in a door's sequence: a port on a given protocol.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct PortSpec {
@@ -74,13 +86,22 @@ const MAX_ATTEMPTS_PER_IP: usize = 256;
 pub struct Matcher {
     doors: Vec<DoorSpec>,
     inflight: HashMap<IpAddr, Vec<Attempt>>,
+    mode: MatchMode,
 }
 
 impl Matcher {
+    /// Build a matcher with the default [`MatchMode::Tolerant`] policy.
+    #[allow(dead_code)] // convenience constructor used by tests; runtime uses `with_mode`
     pub fn new(doors: Vec<DoorSpec>) -> Self {
+        Self::with_mode(doors, MatchMode::Tolerant)
+    }
+
+    /// Build a matcher with an explicit out-of-order policy.
+    pub fn with_mode(doors: Vec<DoorSpec>, mode: MatchMode) -> Self {
         Self {
             doors,
             inflight: HashMap::new(),
+            mode,
         }
     }
 
@@ -95,8 +116,9 @@ impl Matcher {
     /// for the packet's source IP (usually zero, occasionally one, rarely more
     /// when overlapping doors finish on the same hit).
     pub fn process(&mut self, ev: PacketEvent) -> Vec<Completed> {
-        // Split the borrow: `doors` is read-only while we mutate one IP's bucket.
+        // Split the borrow: `doors`/`mode` are read-only while we mutate one IP's bucket.
         let doors = &self.doors;
+        let mode = self.mode;
         let entry = self.inflight.entry(ev.src).or_default();
 
         // 1. Reap attempts whose whole-sequence timeout has elapsed.
@@ -108,14 +130,26 @@ impl Matcher {
         let mut i = 0;
         while i < entry.len() {
             let a = &mut entry[i];
-            let expected = doors[a.door].sequence[a.stage];
+            let seq = &doors[a.door].sequence;
+            let expected = seq[a.stage];
             if expected.port == ev.port && expected.proto == ev.proto {
                 a.stage += 1;
-                if a.stage == doors[a.door].sequence.len() {
-                    completed.push(Completed { door: a.door, src: ev.src });
+                if a.stage == seq.len() {
+                    completed.push(Completed {
+                        door: a.door,
+                        src: ev.src,
+                    });
                     entry.remove(i);
                     continue; // don't advance `i`; the next element shifted down
                 }
+            } else if mode == MatchMode::Reset
+                && seq.iter().any(|p| p.port == ev.port && p.proto == ev.proto)
+            {
+                // knockd parity: a monitored-but-out-of-order hit aborts this
+                // attempt. (A fresh hit to the door's *first* step still opens a
+                // new candidate in step 3, so the client effectively restarts.)
+                entry.remove(i);
+                continue;
             }
             i += 1;
         }
@@ -129,9 +163,16 @@ impl Matcher {
                 Some(p) if p.port == ev.port && p.proto == ev.proto => {
                     if d.sequence.len() == 1 {
                         // Single-step door completes immediately.
-                        completed.push(Completed { door: di, src: ev.src });
+                        completed.push(Completed {
+                            door: di,
+                            src: ev.src,
+                        });
                     } else {
-                        entry.push(Attempt { door: di, stage: 1, started_ms: ev.at_ms });
+                        entry.push(Attempt {
+                            door: di,
+                            stage: 1,
+                            started_ms: ev.at_ms,
+                        });
                     }
                 }
                 _ => {}
@@ -162,7 +203,10 @@ mod tests {
     }
 
     fn tcp(port: u16) -> PortSpec {
-        PortSpec { port, proto: Proto::Tcp }
+        PortSpec {
+            port,
+            proto: Proto::Tcp,
+        }
     }
 
     fn door(name: &str, ports: &[u16], timeout: u64) -> DoorSpec {
@@ -174,7 +218,12 @@ mod tests {
     }
 
     fn ev(src: IpAddr, port: u16, at_ms: u64) -> PacketEvent {
-        PacketEvent { src, port, proto: Proto::Tcp, at_ms }
+        PacketEvent {
+            src,
+            port,
+            proto: Proto::Tcp,
+            at_ms,
+        }
     }
 
     #[test]
@@ -183,7 +232,13 @@ mod tests {
         assert!(m.process(ev(ip(1), 7000, 0)).is_empty());
         assert!(m.process(ev(ip(1), 8000, 100)).is_empty());
         let done = m.process(ev(ip(1), 9000, 200));
-        assert_eq!(done, vec![Completed { door: 0, src: ip(1) }]);
+        assert_eq!(
+            done,
+            vec![Completed {
+                door: 0,
+                src: ip(1)
+            }]
+        );
         // State is cleaned up once the door fires.
         assert_eq!(m.tracked_sources(), 0);
     }
@@ -195,7 +250,13 @@ mod tests {
         // Noise to an unrelated port is ignored; the attempt survives.
         m.process(ev(ip(1), 1234, 50));
         m.process(ev(ip(1), 8000, 100));
-        assert_eq!(m.process(ev(ip(1), 9000, 200)), vec![Completed { door: 0, src: ip(1) }]);
+        assert_eq!(
+            m.process(ev(ip(1), 9000, 200)),
+            vec![Completed {
+                door: 0,
+                src: ip(1)
+            }]
+        );
     }
 
     #[test]
@@ -216,8 +277,20 @@ mod tests {
         m.process(ev(ip(2), 7000, 10));
         m.process(ev(ip(2), 8000, 20));
         m.process(ev(ip(1), 8000, 30));
-        assert_eq!(m.process(ev(ip(1), 9000, 40)), vec![Completed { door: 0, src: ip(1) }]);
-        assert_eq!(m.process(ev(ip(2), 9000, 50)), vec![Completed { door: 0, src: ip(2) }]);
+        assert_eq!(
+            m.process(ev(ip(1), 9000, 40)),
+            vec![Completed {
+                door: 0,
+                src: ip(1)
+            }]
+        );
+        assert_eq!(
+            m.process(ev(ip(2), 9000, 50)),
+            vec![Completed {
+                door: 0,
+                src: ip(2)
+            }]
+        );
     }
 
     #[test]
@@ -228,14 +301,103 @@ mod tests {
             door("b", &[7000, 9000], 10_000),
         ]);
         m.process(ev(ip(1), 7000, 0));
-        assert_eq!(m.process(ev(ip(1), 8000, 10)), vec![Completed { door: 0, src: ip(1) }]);
-        assert_eq!(m.process(ev(ip(1), 9000, 20)), vec![Completed { door: 1, src: ip(1) }]);
+        assert_eq!(
+            m.process(ev(ip(1), 8000, 10)),
+            vec![Completed {
+                door: 0,
+                src: ip(1)
+            }]
+        );
+        assert_eq!(
+            m.process(ev(ip(1), 9000, 20)),
+            vec![Completed {
+                door: 1,
+                src: ip(1)
+            }]
+        );
     }
 
     #[test]
     fn single_step_door_fires_immediately() {
         let mut m = Matcher::new(vec![door("ping", &[12345], 1_000)]);
-        assert_eq!(m.process(ev(ip(1), 12345, 0)), vec![Completed { door: 0, src: ip(1) }]);
+        assert_eq!(
+            m.process(ev(ip(1), 12345, 0)),
+            vec![Completed {
+                door: 0,
+                src: ip(1)
+            }]
+        );
         assert_eq!(m.tracked_sources(), 0);
+    }
+
+    #[test]
+    fn reset_mode_aborts_on_out_of_order_monitored_hit() {
+        // knockd parity: hitting another of the door's own ports out of order
+        // derails the attempt. 7000 → 9000 (skips 8000) → 8000 → 9000 must fail.
+        let mut m = Matcher::with_mode(
+            vec![door("ssh", &[7000, 8000, 9000], 10_000)],
+            MatchMode::Reset,
+        );
+        m.process(ev(ip(1), 7000, 0));
+        m.process(ev(ip(1), 9000, 10)); // out of order, monitored → reset, no new attempt
+        m.process(ev(ip(1), 8000, 20));
+        assert!(m.process(ev(ip(1), 9000, 30)).is_empty());
+        assert_eq!(m.tracked_sources(), 0);
+    }
+
+    #[test]
+    fn reset_mode_ignores_unrelated_noise() {
+        // A hit to a port the door doesn't use is still tolerated, even in Reset
+        // mode — only the door's own ports reset it.
+        let mut m = Matcher::with_mode(
+            vec![door("ssh", &[7000, 8000, 9000], 10_000)],
+            MatchMode::Reset,
+        );
+        m.process(ev(ip(1), 7000, 0));
+        m.process(ev(ip(1), 1234, 10)); // unrelated noise
+        m.process(ev(ip(1), 8000, 20));
+        assert_eq!(
+            m.process(ev(ip(1), 9000, 30)),
+            vec![Completed {
+                door: 0,
+                src: ip(1)
+            }]
+        );
+    }
+
+    #[test]
+    fn reset_mode_lets_a_restart_succeed() {
+        // Re-hitting the first port restarts the sequence: 7000,7000,8000,9000 ok.
+        let mut m = Matcher::with_mode(
+            vec![door("ssh", &[7000, 8000, 9000], 10_000)],
+            MatchMode::Reset,
+        );
+        m.process(ev(ip(1), 7000, 0));
+        m.process(ev(ip(1), 7000, 10)); // resets the first attempt, opens a fresh one
+        m.process(ev(ip(1), 8000, 20));
+        assert_eq!(
+            m.process(ev(ip(1), 9000, 30)),
+            vec![Completed {
+                door: 0,
+                src: ip(1)
+            }]
+        );
+    }
+
+    #[test]
+    fn tolerant_mode_survives_out_of_order_monitored_hit() {
+        // The same sequence the Reset test rejects succeeds under the default
+        // policy, because a stray monitored hit doesn't derail the attempt.
+        let mut m = Matcher::new(vec![door("ssh", &[7000, 8000, 9000], 10_000)]);
+        m.process(ev(ip(1), 7000, 0));
+        m.process(ev(ip(1), 9000, 10));
+        m.process(ev(ip(1), 8000, 20));
+        assert_eq!(
+            m.process(ev(ip(1), 9000, 30)),
+            vec![Completed {
+                door: 0,
+                src: ip(1)
+            }]
+        );
     }
 }

@@ -1,0 +1,66 @@
+# knock-daemon systemd unit.
+#
+# Runs the daemon with *only* the two capabilities it needs instead of full
+# root: CAP_NET_RAW (open the AF_PACKET / libpcap capture socket) and
+# CAP_NET_ADMIN (let the nftables backend, or a privileged firewall command,
+# touch the ruleset). Everything else is locked down by the hardening block.
+#
+# Install:
+#   install -Dm755 target/release/knockd2 /usr/local/bin/knockd2
+#   install -Dm644 packaging/systemd/knockd2.service /etc/systemd/system/knockd2.service
+#   install -Dm600 knockd.toml /etc/knock-daemon/knockd.toml
+#   systemctl daemon-reload && systemctl enable --now knockd2
+#
+# Verify the dropped privileges once it's up:
+#   systemctl show knockd2 -p AmbientCapabilities -p User
+#   grep Cap /proc/$(systemctl show -p MainPID --value knockd2)/status
+
+[Unit]
+Description=knock-daemon — concurrent port-knocking daemon
+Documentation=https://github.com/loic-rosset-ltd/knock-daemon
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/knockd2 --config /etc/knock-daemon/knockd.toml
+Restart=on-failure
+RestartSec=2
+
+# --- Privilege: capabilities instead of root -------------------------------
+# Run as a transient unprivileged user, granting just the two capabilities the
+# daemon and its firewall execs need. AmbientCapabilities makes them inheritable
+# by the nft/iptables child the command backend may spawn.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# --- Sandboxing ------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/knock-daemon
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# AF_PACKET for capture, AF_NETLINK for nftables, plus the basics. If your
+# `command` backend needs to reach the network (e.g. it curls an API), add the
+# families it uses or drop this line.
+RestrictAddressFamilies=AF_PACKET AF_NETLINK AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

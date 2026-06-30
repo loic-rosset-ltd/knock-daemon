@@ -23,10 +23,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # tests run on machines without libpcap headers; the matcher core is pure.
 pcap = { version = "2", optional = true }
 
+# Raw syscalls for the pure-Rust AF_PACKET capture backend (Linux only). The
+# afpacket module is itself cfg(target_os = "linux"); libc compiles everywhere.
+libc = { version = "0.2", optional = true }
+
 [features]
 default = []
 # Enable the libpcap-backed live capture path (requires libpcap-dev / libpcap).
 capture-pcap = ["dep:pcap"]
+# Enable the pure-Rust AF_PACKET capture path (Linux; no libpcap C dependency).
+capture-afpacket = ["dep:libc"]
 
 [profile.release]
 lto = true

@@ -24,7 +24,9 @@ pub struct NftablesFirewall {
 
 impl Default for NftablesFirewall {
     fn default() -> Self {
-        Self { nft: "nft".to_string() }
+        Self {
+            nft: "nft".to_string(),
+        }
     }
 }
 
@@ -51,7 +53,11 @@ impl NftablesFirewall {
 
 impl Firewall for NftablesFirewall {
     fn open(&self, action: &Action, src: IpAddr) -> Result<()> {
-        self.run(&add_element_args(Self::set(action)?, src, action.timeout_ms))
+        self.run(&add_element_args(
+            Self::set(action)?,
+            src,
+            action.timeout_ms,
+        ))
     }
 
     fn close(&self, action: &Action, src: IpAddr) -> Result<()> {
@@ -151,7 +157,10 @@ mod tests {
 
     #[test]
     fn set_parse_defaults_family_to_inet() {
-        assert_eq!(NftSet::parse("filter knock").unwrap(), set_named("inet", "filter", "knock"));
+        assert_eq!(
+            NftSet::parse("filter knock").unwrap(),
+            set_named("inet", "filter", "knock")
+        );
         assert_eq!(
             NftSet::parse("ip6 myt knock").unwrap(),
             set_named("ip6", "myt", "knock")
