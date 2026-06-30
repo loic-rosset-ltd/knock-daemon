@@ -81,9 +81,11 @@ restarts it.
   module and is fully unit-tested against hand-built frames — every live backend
   shares it.
   - `afpacket` backend (feature `capture-afpacket`, Linux): pure-Rust `AF_PACKET`
-    `SOCK_RAW` socket via `libc`, **no libpcap C dependency**. Relevance
-    filtering is done in userspace against the door port set (a kernel cBPF
-    prefilter is a future optimisation). Preferred live backend when built in.
+    `SOCK_RAW` socket via `libc`, **no libpcap C dependency**. A hand-built kernel
+    cBPF prefilter (`SO_ATTACH_FILTER`, from the union of door ports — see
+    `capture::bpf`) drops irrelevant frames before they reach userspace, with the
+    userspace decoder as the source-of-truth backstop. Preferred live backend when
+    built in.
   - `pcap` backend (feature `capture-pcap`): libpcap + a kernel-side BPF filter
     built from the union of door ports.
   - `replay` backend: deterministic, used by `--demo` and tests.
@@ -140,17 +142,17 @@ restarts it.
    capture (feature-gated), command firewall, `--demo`/`--check`.
 2. ~~nftables firewall backend (allow-set element + kernel timeout).~~ **Done** —
    `nft_set` per door, kernel-side element timeout, no userspace close timer.
-3. ~~Pure-Rust `AF_PACKET` capture; IPv6 + VLAN.~~ **Done** — `capture-afpacket`
-   backend (libc, no libpcap), shared `capture::parse` decoder handling
-   IPv4/IPv6/VLAN/QinQ. (Kernel cBPF prefilter for AF_PACKET still open.)
+3. ~~Pure-Rust `AF_PACKET` capture; IPv6 + VLAN; kernel cBPF prefilter.~~ **Done** —
+   `capture-afpacket` backend (libc, no libpcap), shared `capture::parse` decoder
+   handling IPv4/IPv6/VLAN/QinQ, plus a hand-built `SO_ATTACH_FILTER` cBPF
+   prefilter (`capture::bpf`, unit-tested with a software cBPF interpreter).
 4. ~~knockd `.conf` compatibility parser; strict/reset matching mode.~~ **Done** —
    `knockd.rs` parser (auto-selected by extension) + `MatchMode::{Tolerant,Reset}`.
 5. ~~Sharded multi-worker matching; per-source rate limiting; a stats/observability
    endpoint.~~ **Done** — `ShardedMatcher` + per-shard worker threads (one
    `mpsc` channel each, routed by `matcher::shard_for`), a clock-injected
    per-source token-bucket `RateLimiter` (`ratelimit.rs`), and a Prometheus
-   `/metrics` endpoint (`stats.rs`). Next remaining: a kernel cBPF prefilter for
-   AF_PACKET (item 3) — the only open roadmap item.
+   `/metrics` endpoint (`stats.rs`).
 6. ~~systemd unit + capability-based privilege (CAP_NET_RAW + CAP_NET_ADMIN)
    instead of full root.~~ **Done** — `packaging/systemd/knockd2.service`
    (DynamicUser + AmbientCapabilities + hardening).

@@ -20,6 +20,7 @@ pub trait Capture {
     fn run(&mut self, sink: &mut dyn FnMut(PacketEvent)) -> anyhow::Result<()>;
 }
 
+mod bpf;
 mod parse;
 mod replay;
 pub use replay::ReplayCapture;

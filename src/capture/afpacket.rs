@@ -7,12 +7,15 @@
 //! TCP-SYN/UDP — is the shared, unit-tested [`super::parse`] code, so this file
 //! is only the socket plumbing.
 //!
-//! Relevance filtering is done in userspace against the door port set. A
-//! kernel-side cBPF prefilter (`SO_ATTACH_FILTER`) is a worthwhile future
-//! optimisation, but it interacts awkwardly with VLAN offsets, so the MVP keeps
-//! the filter where it's easy to get right and test. The socket needs
-//! `CAP_NET_RAW` (see the systemd unit in `packaging/`); it is therefore, like
-//! the pcap backend, not exercised in CI.
+//! A kernel-side cBPF prefilter (`SO_ATTACH_FILTER`, built in [`super::bpf`])
+//! drops irrelevant frames before they are copied to userspace, so the recv loop
+//! only wakes for plausible knocks. It is a pure optimisation built to never drop
+//! a frame userspace would accept (it accepts in-payload VLAN and IPv6 with
+//! extension headers rather than risk a false negative), so the userspace
+//! [`AfPacketCapture::accepts`] check below stays as the source of truth and the
+//! backstop if the filter can't be attached. The socket needs `CAP_NET_RAW` (see
+//! the systemd unit in `packaging/`); it is therefore, like the pcap backend, not
+//! exercised in CI, but the generated filter program is unit-tested in `bpf`.
 
 use std::ffi::CString;
 use std::io::{Error, ErrorKind};
@@ -24,10 +27,19 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::matcher::PacketEvent;
 
-use super::{parse, Capture};
+use super::{bpf, parse, Capture};
 
 /// EtherType passed to `socket()`; `ETH_P_ALL` delivers every frame.
 const ETH_P_ALL: u16 = 0x0003;
+
+// The cBPF builder emits its own [`bpf::SockFilter`] (so it stays platform-free
+// and unit-testable); we hand the program to the kernel as `libc::sock_filter`.
+// That cast is only sound if the two have identical layout — assert it here so a
+// libc change can never silently corrupt the attached program.
+const _: () = assert!(
+    mem::size_of::<bpf::SockFilter>() == mem::size_of::<libc::sock_filter>()
+        && mem::align_of::<bpf::SockFilter>() == mem::align_of::<libc::sock_filter>()
+);
 
 pub struct AfPacketCapture {
     interface: Option<String>,
@@ -50,6 +62,44 @@ impl AfPacketCapture {
 
     fn accepts(&self, port: u16) -> bool {
         self.ports.is_empty() || self.ports.binary_search(&port).is_ok()
+    }
+
+    /// Attach the kernel cBPF prefilter so irrelevant frames are dropped before
+    /// they reach userspace. Best-effort: if there's no useful filter to build
+    /// (no ports, or too many) or the kernel rejects it, we log and carry on —
+    /// `accepts` still filters in userspace, so correctness never depends on it.
+    ///
+    /// Frames that arrived before the filter was attached bypass it, but those
+    /// too are caught by the userspace check, so the brief startup window only
+    /// costs a little extra work, never a wrong accept.
+    fn attach_prefilter(&self, fd: i32) {
+        let Some(mut prog) = bpf::build_filter(&self.ports) else {
+            return;
+        };
+        let fprog = libc::sock_fprog {
+            len: prog.len() as u16,
+            // Layout-identical to libc::sock_filter (asserted above).
+            filter: prog.as_mut_ptr() as *mut libc::sock_filter,
+        };
+        // SAFETY: setsockopt copies the program in during the call; `prog` and
+        // `fprog` outlive it. The option/level/size are the documented contract.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ATTACH_FILTER,
+                &fprog as *const libc::sock_fprog as *const c_void,
+                mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            tracing::warn!(
+                error = %Error::last_os_error(),
+                "attaching cBPF prefilter failed; relying on userspace filtering"
+            );
+        } else {
+            tracing::debug!(instructions = prog.len(), "attached cBPF prefilter");
+        }
     }
 }
 
@@ -105,6 +155,8 @@ impl Capture for AfPacketCapture {
         if rc < 0 {
             return Err(anyhow!(Error::last_os_error())).context("binding AF_PACKET socket");
         }
+
+        self.attach_prefilter(socket.0);
 
         let mut buf = [0u8; 65536];
         loop {
