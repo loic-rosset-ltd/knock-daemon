@@ -5,7 +5,7 @@ use std::process::Command;
 
 use anyhow::{bail, Result};
 
-use super::Firewall;
+use super::{Action, Firewall};
 
 pub struct CommandFirewall;
 
@@ -22,11 +22,18 @@ impl CommandFirewall {
 }
 
 impl Firewall for CommandFirewall {
-    fn open(&self, command: &str, src: IpAddr) -> Result<()> {
+    fn open(&self, action: &Action, src: IpAddr) -> Result<()> {
+        let Some(command) = action.open_command.as_deref() else {
+            bail!("command backend: door has no open_command");
+        };
         self.run(command, src)
     }
 
-    fn close(&self, command: &str, src: IpAddr) -> Result<()> {
+    fn close(&self, action: &Action, src: IpAddr) -> Result<()> {
+        let Some(command) = action.close_command.as_deref() else {
+            // No close command configured: nothing to undo.
+            return Ok(());
+        };
         self.run(command, src)
     }
 }

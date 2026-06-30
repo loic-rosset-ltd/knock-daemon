@@ -11,7 +11,8 @@ interface = "eth0"
 
 [firewall]
 # "command" — run open_command/close_command with %IP% substituted (knockd-style).
-# "nftables" — manipulate an allow-set element directly (planned; not yet implemented).
+# "nftables" — add the source to an allow-set element with a kernel-side timeout
+#              (each door needs `nft_set`; `cmd_timeout` becomes the element timeout).
 backend = "command"
 
 # A door: an ordered port sequence that, completed in time, opens access.
@@ -31,3 +32,16 @@ name = "https-admin"
 sequence = ["7000/tcp", "8500/tcp", "9100/tcp"]
 seq_timeout = "10s"
 open_command = "nft add element inet filter admin_clients { %IP% }"
+
+# With backend = "nftables", a door names an allow-set instead of commands. The
+# source is added as `nft add element inet filter knock_clients { %IP% timeout 30s }`
+# and the kernel expires it — no close_command, no userspace timer. The set must
+# exist with a timeout flag, e.g.:
+#   nft add set inet filter knock_clients '{ type ipv4_addr; flags timeout; }'
+#
+# [[door]]
+# name = "ssh"
+# sequence = ["7000/tcp", "8000/udp", "9000/tcp"]
+# seq_timeout = "10s"
+# nft_set = "inet filter knock_clients"   # "<family> <table> <set>"; family defaults to inet
+# cmd_timeout = "30s"                       # kernel-side element timeout

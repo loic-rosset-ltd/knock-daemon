@@ -57,8 +57,8 @@ fn main() -> Result<()> {
     let raw = std::fs::read_to_string(&cli.config)
         .with_context(|| format!("reading config {}", cli.config.display()))?;
     let cfg: Config = toml::from_str(&raw).context("parsing config TOML")?;
-    let doors = cfg.resolve().context("validating config")?;
     let fw_kind = cfg.firewall_kind()?;
+    let doors = cfg.resolve(fw_kind).context("validating config")?;
 
     if cli.check {
         let iface = cfg.interface.as_deref().unwrap_or("<capture default>");
@@ -115,22 +115,24 @@ impl Engine {
         for done in self.matcher.process(ev) {
             let door = &self.doors[done.door];
             tracing::info!(door = %door.spec.name, src = %done.src, "knock accepted");
-            if let Err(e) = self.firewall.open(&door.open_command, done.src) {
-                tracing::error!(door = %door.spec.name, error = %e, "open command failed");
+            if let Err(e) = self.firewall.open(&door.action, done.src) {
+                tracing::error!(door = %door.spec.name, error = %e, "open failed");
                 continue;
             }
-            schedule_close(self.firewall.clone(), door, done.src);
+            // nftables expires the element in-kernel; only userspace backends
+            // need a timer to run the close action.
+            if !self.firewall.auto_expires() {
+                schedule_close(self.firewall.clone(), door, done.src);
+            }
         }
     }
 }
 
-/// Build a `Sync`-capable firewall handle. The command backend is stateless.
+/// Build a `Sync`-capable firewall handle. Both backends are stateless.
 fn firewall_arc(kind: firewall::FirewallKind) -> Result<Arc<dyn firewall::Firewall + Sync>> {
     match kind {
         firewall::FirewallKind::Command => Ok(Arc::new(firewall::CommandFirewall)),
-        firewall::FirewallKind::Nftables => {
-            anyhow::bail!("nftables backend is not implemented yet; use backend = \"command\"")
-        }
+        firewall::FirewallKind::Nftables => Ok(Arc::new(firewall::NftablesFirewall::default())),
     }
 }
 
@@ -141,15 +143,17 @@ fn schedule_close(
     door: &ResolvedDoor,
     src: IpAddr,
 ) {
-    let (Some(timeout_ms), Some(close)) = (door.cmd_timeout_ms, door.close_command.clone()) else {
+    let (Some(timeout_ms), true) = (door.action.timeout_ms, door.action.close_command.is_some())
+    else {
         return;
     };
     let name = door.spec.name.clone();
+    let action = door.action.clone();
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(timeout_ms));
         tracing::info!(door = %name, src = %src, "auto-closing after cmd_timeout");
-        if let Err(e) = firewall.close(&close, src) {
-            tracing::error!(door = %name, error = %e, "close command failed");
+        if let Err(e) = firewall.close(&action, src) {
+            tracing::error!(door = %name, error = %e, "close failed");
         }
     });
 }
@@ -179,9 +183,10 @@ fn run_demo() -> Result<()> {
             ],
             seq_timeout_ms: 10_000,
         },
-        open_command: "echo would-open %IP%".into(),
-        close_command: None,
-        cmd_timeout_ms: None,
+        action: firewall::Action {
+            open_command: Some("echo would-open %IP%".into()),
+            ..Default::default()
+        },
     }];
 
     // Two clients (.10 and .20) knock the SAME door at the SAME time, fully

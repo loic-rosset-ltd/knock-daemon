@@ -6,7 +6,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::firewall::FirewallKind;
+use crate::firewall::{Action, FirewallKind, NftSet};
 use crate::matcher::{DoorSpec, PortSpec, Proto};
 
 #[derive(Debug, Deserialize)]
@@ -38,11 +38,17 @@ pub struct DoorConfig {
     /// Whole-sequence timeout, e.g. "10s", "500ms". Defaults to 15s.
     #[serde(default = "default_seq_timeout")]
     pub seq_timeout: String,
-    /// Shell command run on a successful knock; `%IP%` is replaced with the source.
-    pub open_command: String,
-    /// Optional command to undo the open (run after `cmd_timeout`, if set).
+    /// `command` backend: shell command run on a successful knock; `%IP%` is
+    /// replaced with the source. Required when the firewall backend is `command`.
+    pub open_command: Option<String>,
+    /// `command` backend: optional command to undo the open (run after
+    /// `cmd_timeout`, if set).
     pub close_command: Option<String>,
-    /// Optional auto-close delay, e.g. "30s".
+    /// `nftables` backend: the allow-set the source is added to, e.g.
+    /// "inet filter knock_clients". Required when the backend is `nftables`.
+    pub nft_set: Option<String>,
+    /// Optional auto-close delay, e.g. "30s". For `command` this schedules
+    /// `close_command`; for `nftables` it becomes the element's kernel timeout.
     pub cmd_timeout: Option<String>,
 }
 
@@ -54,9 +60,7 @@ fn default_seq_timeout() -> String {
 #[derive(Debug, Clone)]
 pub struct ResolvedDoor {
     pub spec: DoorSpec,
-    pub open_command: String,
-    pub close_command: Option<String>,
-    pub cmd_timeout_ms: Option<u64>,
+    pub action: Action,
 }
 
 impl Config {
@@ -68,17 +72,18 @@ impl Config {
         }
     }
 
-    /// Validate and lower the parsed config into runtime doors.
-    pub fn resolve(&self) -> Result<Vec<ResolvedDoor>> {
+    /// Validate and lower the parsed config into runtime doors, checking that
+    /// each door carries the fields the active firewall backend needs.
+    pub fn resolve(&self, kind: FirewallKind) -> Result<Vec<ResolvedDoor>> {
         if self.doors.is_empty() {
             bail!("config defines no [[door]] sections");
         }
-        self.doors.iter().map(|d| d.resolve()).collect()
+        self.doors.iter().map(|d| d.resolve(kind)).collect()
     }
 }
 
 impl DoorConfig {
-    fn resolve(&self) -> Result<ResolvedDoor> {
+    fn resolve(&self, kind: FirewallKind) -> Result<ResolvedDoor> {
         if self.sequence.is_empty() {
             bail!("door {:?} has an empty sequence", self.name);
         }
@@ -89,6 +94,31 @@ impl DoorConfig {
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("door {:?}", self.name))?;
 
+        let timeout_ms = self
+            .cmd_timeout
+            .as_deref()
+            .map(parse_duration_ms)
+            .transpose()
+            .with_context(|| format!("door {:?} cmd_timeout", self.name))?;
+
+        let nft_set = self
+            .nft_set
+            .as_deref()
+            .map(NftSet::parse)
+            .transpose()
+            .with_context(|| format!("door {:?}", self.name))?;
+
+        // Backend-specific requirements: a door must carry what its backend acts on.
+        match kind {
+            FirewallKind::Command if self.open_command.is_none() => {
+                bail!("door {:?}: command backend requires open_command", self.name)
+            }
+            FirewallKind::Nftables if nft_set.is_none() => {
+                bail!("door {:?}: nftables backend requires nft_set", self.name)
+            }
+            _ => {}
+        }
+
         Ok(ResolvedDoor {
             spec: DoorSpec {
                 name: self.name.clone(),
@@ -96,14 +126,12 @@ impl DoorConfig {
                 seq_timeout_ms: parse_duration_ms(&self.seq_timeout)
                     .with_context(|| format!("door {:?} seq_timeout", self.name))?,
             },
-            open_command: self.open_command.clone(),
-            close_command: self.close_command.clone(),
-            cmd_timeout_ms: self
-                .cmd_timeout
-                .as_deref()
-                .map(parse_duration_ms)
-                .transpose()
-                .with_context(|| format!("door {:?} cmd_timeout", self.name))?,
+            action: Action {
+                open_command: self.open_command.clone(),
+                close_command: self.close_command.clone(),
+                nft_set,
+                timeout_ms,
+            },
         })
     }
 }
@@ -181,11 +209,55 @@ mod tests {
             cmd_timeout = "30s"
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        let doors = cfg.resolve().unwrap();
+        let kind = cfg.firewall_kind().unwrap();
+        let doors = cfg.resolve(kind).unwrap();
         assert_eq!(doors.len(), 1);
         assert_eq!(doors[0].spec.sequence.len(), 3);
         assert_eq!(doors[0].spec.seq_timeout_ms, 10_000);
-        assert_eq!(doors[0].cmd_timeout_ms, Some(30_000));
+        assert_eq!(doors[0].action.timeout_ms, Some(30_000));
         assert_eq!(doors[0].spec.sequence[1].proto, Proto::Udp);
+    }
+
+    #[test]
+    fn nftables_door_resolves_with_an_nft_set() {
+        let toml = r#"
+            [firewall]
+            backend = "nftables"
+            [[door]]
+            name = "ssh"
+            sequence = ["7000/tcp", "8000/tcp"]
+            nft_set = "inet filter knock_clients"
+            cmd_timeout = "30s"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let kind = cfg.firewall_kind().unwrap();
+        let doors = cfg.resolve(kind).unwrap();
+        let set = doors[0].action.nft_set.as_ref().unwrap();
+        assert_eq!(set.set, "knock_clients");
+        assert_eq!(doors[0].action.timeout_ms, Some(30_000));
+    }
+
+    #[test]
+    fn backend_specific_fields_are_required() {
+        // command backend without open_command
+        let toml = r#"
+            [[door]]
+            name = "ssh"
+            sequence = ["7000/tcp"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.resolve(FirewallKind::Command).is_err());
+
+        // nftables backend without nft_set
+        let toml = r#"
+            [firewall]
+            backend = "nftables"
+            [[door]]
+            name = "ssh"
+            sequence = ["7000/tcp"]
+            open_command = "true"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.resolve(FirewallKind::Nftables).is_err());
     }
 }

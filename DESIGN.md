@@ -75,11 +75,18 @@ A configurable strict/reset mode is a planned option for knockd parity.
     libpcap C dependency, plus IPv6 and VLAN handling.
   - `replay` backend: deterministic, used by `--demo` and tests.
 - **`matcher.rs`** — the concurrent core described above.
-- **`firewall/`** — `Firewall` trait with open/close side effects.
-  - `command` backend (MVP): substitute `%IP%` and run via the shell — a drop-in
-    for existing knockd command setups.
-  - *Planned:* `nftables` backend that adds the source to an allow-set element
-    with a kernel-side timeout (no fork per knock, atomic, auto-expiring).
+- **`firewall/`** — `Firewall` trait with open/close side effects. The runtime
+  hands each backend a per-door `Action` (open/close commands, nft set, timeout),
+  so backends stay decoupled from config parsing.
+  - `command` backend: substitute `%IP%` and run via the shell — a drop-in for
+    existing knockd command setups. Expiry is a userspace timer that runs the
+    close command after `cmd_timeout`.
+  - `nftables` backend: add the source to a named allow-set as an element with a
+    kernel-side timeout — `nft add element <family> <table> <set> { <ip> timeout
+    <T> }`. One atomic call, no fork per knock, and the kernel reaps the element
+    on its own, so the backend reports `auto_expires()` and the runtime skips the
+    userspace close timer. (The argv builders are pure and unit-tested without
+    `nft` present.)
 - **`config.rs`** — TOML config → validated runtime doors. A knockd-`.conf`
   compatibility parser is planned to ease migration.
 - **`main.rs`** — CLI (`--config`, `--check`, `--demo`), logging, and the
@@ -103,7 +110,8 @@ A configurable strict/reset mode is a planned option for knockd parity.
 
 1. **MVP (this scaffold):** concurrent matcher + tests, TOML config, libpcap
    capture (feature-gated), command firewall, `--demo`/`--check`.
-2. nftables firewall backend (allow-set element + kernel timeout).
+2. ~~nftables firewall backend (allow-set element + kernel timeout).~~ **Done** —
+   `nft_set` per door, kernel-side element timeout, no userspace close timer.
 3. Pure-Rust `AF_PACKET`/eBPF capture; IPv6 + VLAN.
 4. knockd `.conf` compatibility parser; strict/reset matching mode.
 5. Sharded multi-worker matching; per-source rate limiting; a stats/observability
