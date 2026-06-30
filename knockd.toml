@@ -24,6 +24,23 @@ backend = "command"
 #                          the attempt (the classic reset-on-stray behaviour).
 mode = "tolerant"
 
+# Number of matcher worker threads. Sources are partitioned by IP across shards
+# (each shard owns its own thread), so concurrent clients scale across cores with
+# no cross-shard coordination. 1 (default) = single-threaded; 0 = auto-detect.
+shards = 1
+
+# Optional per-source rate limit, "<count>/<duration>": a token bucket allowing a
+# burst of <count> packets per source IP, refilling at <count> per <duration>.
+# Packets over budget are dropped before matching, so a flood from one address
+# can't drown out others or burn CPU. Omit for no limit.
+# rate_limit = "50/10s"
+
+[stats]
+# Serve Prometheus metrics (packets observed/rate-limited, knocks accepted per
+# door, in-flight sources) over HTTP at this address. Bind to localhost or a
+# trusted management interface. Omit to disable the endpoint.
+# listen = "127.0.0.1:9099"
+
 # A door: an ordered port sequence that, completed in time, opens access.
 # Steps are "<port>/<tcp|udp>"; a bare number defaults to tcp.
 [[door]]

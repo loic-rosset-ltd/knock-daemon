@@ -10,9 +10,12 @@ mod config;
 mod firewall;
 mod knockd;
 mod matcher;
+mod ratelimit;
+mod stats;
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -22,7 +25,11 @@ use clap::Parser;
 
 use capture::{Capture, ReplayCapture};
 use config::{Config, ResolvedDoor};
-use matcher::{MatchMode, Matcher, PacketEvent, Proto};
+use matcher::{MatchMode, Matcher, PacketEvent, Proto, ShardedMatcher};
+
+/// Per-shard cap on the number of source IPs the rate limiter tracks. Bounds the
+/// limiter's own memory so it can't become an exhaustion vector itself.
+const RATE_LIMIT_MAX_SOURCES: usize = 65_536;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -69,6 +76,10 @@ fn main() -> Result<()> {
     };
     let fw_kind = cfg.firewall_kind()?;
     let mode = cfg.match_mode()?;
+    // Validate the runtime tunables here too, so `--check` rejects a malformed
+    // rate_limit instead of the daemon failing only at startup.
+    let rate = cfg.rate_limit()?;
+    let shards = cfg.shard_count();
     let doors = cfg.resolve(fw_kind).context("validating config")?;
 
     if cli.check {
@@ -78,6 +89,11 @@ fn main() -> Result<()> {
             doors.len(),
             fw_kind,
             mode
+        );
+        println!(
+            "  shards = {shards}, rate_limit = {}, stats endpoint = {}",
+            cfg.matching.rate_limit.as_deref().unwrap_or("none"),
+            cfg.stats_listen().unwrap_or("disabled"),
         );
         for d in &doors {
             println!(
@@ -90,36 +106,139 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_live(cfg, doors, fw_kind, mode)
+    run_live(cfg, doors, fw_kind, mode, shards, rate)
 }
 
 /// Drive the capture → matcher → firewall pipeline against live traffic, using
 /// whichever capture backend this binary was built with.
+///
+/// Matching is sharded by source IP across `cfg.shard_count()` worker threads:
+/// the capture loop only hashes each packet to a shard and forwards it down a
+/// channel, so packet decoding never blocks on matching or firewall I/O. Because
+/// sources partition cleanly across shards, the per-source isolation guarantee is
+/// preserved with zero cross-shard coordination.
 fn run_live(
     cfg: Config,
     doors: Vec<ResolvedDoor>,
     fw_kind: firewall::FirewallKind,
     mode: MatchMode,
+    n_shards: usize,
+    rate: Option<config::RateSpec>,
 ) -> Result<()> {
     let ports: Vec<u16> = doors
         .iter()
         .flat_map(|d| d.spec.sequence.iter().map(|p| p.port))
         .collect();
     let mut cap = capture::open_live(cfg.interface.clone(), &ports)?;
-    let mut engine = Engine::new(doors, fw_kind, mode)?;
-    tracing::info!("knock-daemon up; capturing live traffic");
-    cap.run(&mut |ev| engine.on_packet(ev))
+
+    let firewall = firewall_arc(fw_kind)?;
+    let stats = Arc::new(stats::Stats::new(
+        doors.iter().map(|d| d.spec.name.clone()).collect(),
+        n_shards,
+    ));
+
+    if let Some(addr) = cfg.stats_listen() {
+        stats::serve(addr, stats.clone())?;
+    }
+
+    // One worker thread per shard, each owning its own matcher + rate limiter.
+    let specs: Vec<matcher::DoorSpec> = doors.iter().map(|d| d.spec.clone()).collect();
+    let doors = Arc::new(doors);
+    let mut senders = Vec::with_capacity(n_shards);
+    let mut handles = Vec::with_capacity(n_shards);
+    for shard in 0..n_shards {
+        let (tx, rx) = mpsc::channel::<PacketEvent>();
+        senders.push(tx);
+        let worker = Worker {
+            shard,
+            matcher: Matcher::with_mode(specs.clone(), mode),
+            limiter: rate.map(|r| r.build(RATE_LIMIT_MAX_SOURCES)),
+            doors: doors.clone(),
+            firewall: firewall.clone(),
+            stats: stats.clone(),
+        };
+        handles.push(thread::spawn(move || worker.run(rx)));
+    }
+
+    tracing::info!(
+        shards = n_shards,
+        rate_limited = rate.is_some(),
+        "knock-daemon up; capturing live traffic"
+    );
+
+    let result = cap.run(&mut |ev| {
+        stats.record_observed();
+        let s = matcher::shard_for(&ev.src, n_shards);
+        // A worker only stops if it panicked; surface that rather than silently
+        // dropping the source's traffic.
+        if senders[s].send(ev).is_err() {
+            tracing::error!(shard = s, "matcher worker stopped; dropping packet");
+        }
+    });
+
+    // Closing the senders ends each worker's `for ev in rx` loop; join so any
+    // in-flight close timers and logging flush before we return.
+    drop(senders);
+    for h in handles {
+        let _ = h.join();
+    }
+    result
 }
 
-/// The matching + action half of the pipeline, independent of the capture source.
-struct Engine {
+/// One matcher shard: owns a [`Matcher`] (and optional rate limiter) for the
+/// subset of source IPs that hash to it, and acts on completed knocks.
+struct Worker {
+    shard: usize,
     matcher: Matcher,
+    limiter: Option<ratelimit::RateLimiter>,
+    doors: Arc<Vec<ResolvedDoor>>,
+    firewall: Arc<dyn firewall::Firewall + Sync>,
+    stats: Arc<stats::Stats>,
+}
+
+impl Worker {
+    /// Consume packets from the shard channel until it closes.
+    fn run(mut self, rx: mpsc::Receiver<PacketEvent>) {
+        for ev in rx {
+            if let Some(limiter) = self.limiter.as_mut() {
+                if !limiter.allow(ev.src, ev.at_ms) {
+                    self.stats.record_rate_limited();
+                    continue;
+                }
+            }
+            for done in self.matcher.process(ev) {
+                self.stats.record_accepted(done.door);
+                open_door(&self.firewall, &self.doors[done.door], done.src);
+            }
+            self.stats
+                .set_tracked(self.shard, self.matcher.tracked_sources());
+        }
+    }
+}
+
+/// Run a door's open side effect and, for backends that don't self-expire,
+/// schedule the matching close. Shared by the live workers and the `--demo` path.
+fn open_door(firewall: &Arc<dyn firewall::Firewall + Sync>, door: &ResolvedDoor, src: IpAddr) {
+    tracing::info!(door = %door.spec.name, src = %src, "knock accepted");
+    if let Err(e) = firewall.open(&door.action, src) {
+        tracing::error!(door = %door.spec.name, error = %e, "open failed");
+        return;
+    }
+    // nftables expires the element in-kernel; only userspace backends need a
+    // timer to run the close action.
+    if !firewall.auto_expires() {
+        schedule_close(firewall.clone(), door, src);
+    }
+}
+
+/// The matching + action half of the pipeline for the single-threaded `--demo`
+/// replay, where deterministic ordering matters more than throughput.
+struct Engine {
+    matcher: ShardedMatcher,
     doors: Vec<ResolvedDoor>,
     firewall: Arc<dyn firewall::Firewall + Sync>,
 }
 
-// CommandFirewall is stateless; mark the trait-object usage Sync-safe via Arc.
-// (Box<dyn Firewall> is Send; we wrap in Arc and require Sync at construction.)
 impl Engine {
     fn new(
         doors: Vec<ResolvedDoor>,
@@ -129,7 +248,9 @@ impl Engine {
         let specs = doors.iter().map(|d| d.spec.clone()).collect();
         let firewall = firewall_arc(fw_kind)?;
         Ok(Self {
-            matcher: Matcher::with_mode(specs, mode),
+            // A single shard keeps the replay deterministic while still
+            // exercising the sharded routing used in production.
+            matcher: ShardedMatcher::new(specs, mode, 1),
             doors,
             firewall,
         })
@@ -138,17 +259,7 @@ impl Engine {
     /// Feed one packet; run actions for any completed doors.
     fn on_packet(&mut self, ev: PacketEvent) {
         for done in self.matcher.process(ev) {
-            let door = &self.doors[done.door];
-            tracing::info!(door = %door.spec.name, src = %done.src, "knock accepted");
-            if let Err(e) = self.firewall.open(&door.action, done.src) {
-                tracing::error!(door = %door.spec.name, error = %e, "open failed");
-                continue;
-            }
-            // nftables expires the element in-kernel; only userspace backends
-            // need a timer to run the close action.
-            if !self.firewall.auto_expires() {
-                schedule_close(self.firewall.clone(), door, done.src);
-            }
+            open_door(&self.firewall, &self.doors[done.door], done.src);
         }
     }
 }

@@ -21,8 +21,10 @@ libpcap path (`capture-pcap`) — sharing a unit-tested frame decoder
 (IPv4/IPv6/VLAN/QinQ). Both firewall backends ship: `command` (knockd-style) and
 `nftables` (allow-set element with a kernel-side timeout). Classic knockd
 `.conf` files are parsed for drop-in migration, and a systemd unit runs the
-daemon with `CAP_NET_RAW`/`CAP_NET_ADMIN` instead of root. See
-[DESIGN.md](DESIGN.md) for the architecture and roadmap.
+daemon with `CAP_NET_RAW`/`CAP_NET_ADMIN` instead of root. Matching shards across
+worker threads by source IP, with an optional per-source rate limiter and a
+Prometheus `/metrics` endpoint. See [DESIGN.md](DESIGN.md) for the architecture
+and roadmap.
 
 ## Try it (no root, no libpcap)
 
@@ -106,6 +108,31 @@ aborts the attempt:
 ```toml
 [matching]
 mode = "tolerant"   # default; or "reset" for knockd-style reset-on-stray
+```
+
+### Scaling, rate limiting, and metrics
+
+Matching is partitioned by source IP across worker threads, so concurrent clients
+scale across cores with no cross-shard coordination. An optional per-source token
+bucket sheds floods before they reach the matcher, and an HTTP endpoint exposes
+Prometheus counters:
+
+```toml
+[matching]
+shards = 0              # worker threads; 1 = single-threaded, 0 = auto-detect CPUs
+rate_limit = "50/10s"   # per source IP: burst of 50, refilling 50 per 10s (omit = unlimited)
+
+[stats]
+listen = "127.0.0.1:9099"   # GET /metrics → Prometheus text; omit to disable
+```
+
+```sh
+curl -s http://127.0.0.1:9099/metrics
+# knockd2_packets_observed_total ...
+# knockd2_packets_rate_limited_total ...
+# knockd2_knocks_accepted_total ...
+# knockd2_door_accepted_total{door="ssh"} ...
+# knockd2_tracked_sources ...
 ```
 
 ## Migrating from knockd

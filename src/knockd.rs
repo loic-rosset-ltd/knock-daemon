@@ -14,7 +14,7 @@
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{Config, DoorConfig, FirewallConfig, MatchingConfig};
+use crate::config::{Config, DoorConfig, FirewallConfig, MatchingConfig, StatsConfig};
 
 /// Parse the text of a knockd `.conf` file into a native [`Config`].
 pub fn parse_conf(text: &str) -> Result<Config> {
@@ -78,10 +78,14 @@ pub fn parse_conf(text: &str) -> Result<Config> {
         firewall: FirewallConfig {
             backend: "command".to_string(),
         },
-        // knockd resets on any out-of-order hit; match that for parity.
+        // knockd resets on any out-of-order hit; match that for parity. Sharding,
+        // rate limiting, and the stats endpoint are knockd2 extensions with no
+        // legacy equivalent, so they take their native defaults.
         matching: MatchingConfig {
             mode: "reset".to_string(),
+            ..MatchingConfig::default()
         },
+        stats: StatsConfig::default(),
         doors,
     })
 }

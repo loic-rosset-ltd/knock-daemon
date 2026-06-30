@@ -31,8 +31,11 @@ an independent in-flight *attempt* for every door. Consequences:
 - **Overlapping doors both advance** — a packet matching the next step of several
   candidate attempts drives all of them forward.
 - **Naturally shardable** — because sources are independent, the design scales by
-  hashing source IP across worker shards with zero cross-shard coordination.
-  (MVP runs single-threaded matching; the data model is the part that matters.)
+  hashing source IP across worker shards with zero cross-shard coordination. This
+  is realised by `ShardedMatcher` and the runtime's per-shard worker threads: the
+  capture loop only hashes each packet to a shard (`matcher::shard_for`) and hands
+  it off down a channel, so packet decoding never blocks on matching or firewall
+  I/O, and a source always lands on the same shard so its isolation is preserved.
 
 The matcher (`src/matcher.rs`) is **pure and deterministic**: each event carries a
 logical millisecond timestamp instead of the matcher reading the clock, so the
@@ -85,7 +88,17 @@ restarts it.
     built from the union of door ports.
   - `replay` backend: deterministic, used by `--demo` and tests.
   - `capture::open_live` picks the best backend compiled in (afpacket > pcap).
-- **`matcher.rs`** — the concurrent core described above.
+- **`matcher.rs`** — the concurrent core described above, plus `ShardedMatcher`
+  (the per-IP partition that lets each shard run on its own worker thread).
+- **`ratelimit.rs`** — an optional per-source token-bucket rate limiter, in the
+  same clock-injected, fully-unit-tested spirit as the matcher. A source over its
+  budget has packets dropped before they reach the matcher, so a flood can't drown
+  out legitimate knocks or burn CPU. One limiter lives inside each shard, so it
+  needs no cross-shard coordination either.
+- **`stats.rs`** — process-wide atomic counters (packets observed/rate-limited,
+  knocks accepted overall and per door, in-flight sources) exposed in Prometheus
+  text format over a minimal HTTP `/metrics` endpoint (`[stats] listen`). The
+  renderer is pure and unit-tested; the listener is thin glue.
 - **`firewall/`** — `Firewall` trait with open/close side effects. The runtime
   hands each backend a per-door `Action` (open/close commands, nft set, timeout),
   so backends stay decoupled from config parsing.
@@ -132,12 +145,15 @@ restarts it.
    IPv4/IPv6/VLAN/QinQ. (Kernel cBPF prefilter for AF_PACKET still open.)
 4. ~~knockd `.conf` compatibility parser; strict/reset matching mode.~~ **Done** —
    `knockd.rs` parser (auto-selected by extension) + `MatchMode::{Tolerant,Reset}`.
-5. Sharded multi-worker matching; per-source rate limiting; a stats/observability
-   endpoint.
+5. ~~Sharded multi-worker matching; per-source rate limiting; a stats/observability
+   endpoint.~~ **Done** — `ShardedMatcher` + per-shard worker threads (one
+   `mpsc` channel each, routed by `matcher::shard_for`), a clock-injected
+   per-source token-bucket `RateLimiter` (`ratelimit.rs`), and a Prometheus
+   `/metrics` endpoint (`stats.rs`). Next remaining: a kernel cBPF prefilter for
+   AF_PACKET (item 3) — the only open roadmap item.
 6. ~~systemd unit + capability-based privilege (CAP_NET_RAW + CAP_NET_ADMIN)
    instead of full root.~~ **Done** — `packaging/systemd/knockd2.service`
-   (DynamicUser + AmbientCapabilities + hardening). Next: a kernel cBPF prefilter
-   (item 3) and the sharded matcher (item 5).
+   (DynamicUser + AmbientCapabilities + hardening).
 
 ## Privileges & threat model
 
@@ -148,7 +164,10 @@ unit (`packaging/systemd/knockd2.service`) uses a `DynamicUser` plus
 running as root; the ambient grant is inherited by any `nft`/`iptables` child the
 command backend execs. The daemon observes opening packets only and never
 terminates connections, so it can't be tricked into dropping traffic. Per-IP
-state is bounded (`MAX_ATTEMPTS_PER_IP`) to blunt state-exhaustion attempts;
-per-source rate limiting is on the roadmap.
+state is bounded (`MAX_ATTEMPTS_PER_IP`) to blunt state-exhaustion attempts, and
+the optional per-source rate limiter (`[matching] rate_limit`) sheds a flood
+before it reaches the matcher at all. The stats endpoint (`[stats] listen`) is a
+plain TCP listener needing no extra capability; bind it to localhost (or a
+trusted management interface) since it exposes operational counters, not secrets.
 Knock secrecy is the usual port-knocking model — the sequence is the secret;
 combine with `seq_timeout` and short `cmd_timeout` windows to limit replay value.

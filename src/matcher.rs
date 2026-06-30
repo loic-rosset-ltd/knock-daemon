@@ -193,6 +193,58 @@ impl Matcher {
     }
 }
 
+/// Map a source IP to one of `n_shards` matcher shards.
+///
+/// Because matching state is partitioned per source IP, a source can be handled
+/// by *any* shard as long as it always lands on the **same** one — so the routing
+/// only has to be deterministic. A fixed-seed hash gives that without a clock or
+/// randomness, keeping the choice reproducible across runs and in tests. `n_shards`
+/// is treated as at least 1.
+pub fn shard_for(src: &IpAddr, n_shards: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let n = n_shards.max(1) as u64;
+    // DefaultHasher::new() uses fixed keys, so this is deterministic across
+    // processes (unlike RandomState) — important for a stable shard mapping.
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    src.hash(&mut h);
+    (h.finish() % n) as usize
+}
+
+/// A matcher partitioned into independent shards by source IP.
+///
+/// Each shard is a self-contained [`Matcher`]; a source always routes to the same
+/// shard via [`shard_for`], so the shards share no state and need no coordination.
+/// This is the data model behind multi-worker matching: the runtime can drive each
+/// shard from its own thread (see `main.rs`), and because the partition is by
+/// source, the per-source isolation guarantee is preserved exactly. Used directly
+/// (single-threaded) for the `--demo` pipeline and to prove the routing in tests.
+pub struct ShardedMatcher {
+    shards: Vec<Matcher>,
+}
+
+impl ShardedMatcher {
+    /// Build `n_shards` (at least 1) shards, each a full matcher over `doors`.
+    pub fn new(doors: Vec<DoorSpec>, mode: MatchMode, n_shards: usize) -> Self {
+        let n = n_shards.max(1);
+        let shards = (0..n)
+            .map(|_| Matcher::with_mode(doors.clone(), mode))
+            .collect();
+        Self { shards }
+    }
+
+    /// Route a packet to its source's shard and process it there.
+    pub fn process(&mut self, ev: PacketEvent) -> Vec<Completed> {
+        let s = shard_for(&ev.src, self.shards.len());
+        self.shards[s].process(ev)
+    }
+
+    /// Total source IPs with in-flight attempts across all shards.
+    #[allow(dead_code)] // reserved for the stats endpoint when run single-sharded
+    pub fn tracked_sources(&self) -> usize {
+        self.shards.iter().map(|m| m.tracked_sources()).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +434,83 @@ mod tests {
                 src: ip(1)
             }]
         );
+    }
+
+    #[test]
+    fn sharding_matches_a_single_matcher() {
+        // Sharding must not change *which* knocks complete: the per-source
+        // partition is transparent. Run an interleaved multi-source stream
+        // through one matcher and through a 4-shard sharded matcher; the streams
+        // of completions must be identical.
+        let doors = vec![
+            door("ssh", &[7000, 8000, 9000], 10_000),
+            door("admin", &[7000, 8500], 10_000),
+        ];
+        let events = [
+            (ip(1), 7000, 0),
+            (ip(2), 7000, 5),
+            (ip(3), 7000, 8),
+            (ip(2), 8500, 12), // ip(2) completes "admin"
+            (ip(1), 8000, 18),
+            (ip(3), 8000, 20),
+            (ip(1), 9000, 25), // ip(1) completes "ssh"
+            (ip(4), 1234, 26), // noise from a fresh source
+            (ip(3), 9000, 30), // ip(3) completes "ssh"
+        ];
+
+        let mut single = Matcher::new(doors.clone());
+        let mut sharded = ShardedMatcher::new(doors, MatchMode::Tolerant, 4);
+        for &(src, port, t) in &events {
+            assert_eq!(
+                single.process(ev(src, port, t)),
+                sharded.process(ev(src, port, t))
+            );
+        }
+    }
+
+    #[test]
+    fn sharded_sources_are_isolated() {
+        // Two clients on the same door, interleaved, must both succeed even when
+        // spread across shards — the multi-worker analogue of the single-matcher
+        // concurrency test.
+        let mut m = ShardedMatcher::new(
+            vec![door("ssh", &[7000, 8000, 9000], 10_000)],
+            MatchMode::Tolerant,
+            8,
+        );
+        m.process(ev(ip(1), 7000, 0));
+        m.process(ev(ip(2), 7000, 10));
+        m.process(ev(ip(2), 8000, 20));
+        m.process(ev(ip(1), 8000, 30));
+        assert_eq!(
+            m.process(ev(ip(1), 9000, 40)),
+            vec![Completed {
+                door: 0,
+                src: ip(1)
+            }]
+        );
+        assert_eq!(
+            m.process(ev(ip(2), 9000, 50)),
+            vec![Completed {
+                door: 0,
+                src: ip(2)
+            }]
+        );
+        assert_eq!(m.tracked_sources(), 0);
+    }
+
+    #[test]
+    fn shard_for_is_deterministic_and_in_range() {
+        for n in [1usize, 2, 4, 7, 16] {
+            for octet in 0..32u8 {
+                let s = shard_for(&ip(octet), n);
+                assert!(s < n);
+                // Stable across calls.
+                assert_eq!(s, shard_for(&ip(octet), n));
+            }
+        }
+        // n_shards = 0 is treated as 1.
+        assert_eq!(shard_for(&ip(1), 0), 0);
     }
 
     #[test]

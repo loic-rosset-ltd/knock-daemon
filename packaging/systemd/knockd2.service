@@ -57,9 +57,9 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-# AF_PACKET for capture, AF_NETLINK for nftables, plus the basics. If your
-# `command` backend needs to reach the network (e.g. it curls an API), add the
-# families it uses or drop this line.
+# AF_PACKET for capture, AF_NETLINK for nftables, AF_INET/AF_INET6 for the
+# optional [stats] metrics endpoint, plus the basics. If your `command` backend
+# needs to reach the network (e.g. it curls an API), add the families it uses.
 RestrictAddressFamilies=AF_PACKET AF_NETLINK AF_UNIX AF_INET AF_INET6
 
 [Install]

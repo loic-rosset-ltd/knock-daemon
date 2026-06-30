@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 use crate::firewall::{Action, FirewallKind, NftSet};
 use crate::matcher::{DoorSpec, MatchMode, PortSpec, Proto};
+use crate::ratelimit::RateLimiter;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -18,6 +19,8 @@ pub struct Config {
     pub firewall: FirewallConfig,
     #[serde(default)]
     pub matching: MatchingConfig,
+    #[serde(default)]
+    pub stats: StatsConfig,
     #[serde(rename = "door", default)]
     pub doors: Vec<DoorConfig>,
 }
@@ -27,29 +30,79 @@ pub struct MatchingConfig {
     /// "tolerant" (default) or "reset" (knockd parity). See [`MatchMode`].
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// Number of matcher worker shards. 1 (default) = single-threaded; `0` =
+    /// auto-detect from available CPUs. Sources are partitioned by IP across
+    /// shards, each driven by its own worker thread.
+    #[serde(default = "default_shards")]
+    pub shards: usize,
+    /// Optional per-source rate limit, `"<count>/<duration>"` (e.g. `"50/10s"` =
+    /// a burst of 50 packets per source, refilling at 50 per 10s). `None` =
+    /// unlimited. Packets over budget are dropped before matching.
+    pub rate_limit: Option<String>,
 }
 
 fn default_mode() -> String {
     "tolerant".to_string()
 }
 
+fn default_shards() -> usize {
+    1
+}
+
 impl Default for MatchingConfig {
     fn default() -> Self {
         Self {
             mode: default_mode(),
+            shards: default_shards(),
+            rate_limit: None,
         }
     }
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct StatsConfig {
+    /// Optional `host:port` to serve Prometheus metrics on (e.g.
+    /// `"127.0.0.1:9099"`). `None` disables the endpoint.
+    pub listen: Option<String>,
+}
+
+/// A parsed rate-limit spec, ready to build a [`RateLimiter`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateSpec {
+    /// Burst size (tokens) per source.
+    pub capacity: f64,
+    /// Sustained refill rate in tokens per millisecond.
+    pub refill_per_ms: f64,
+}
+
+impl RateSpec {
+    /// Build a limiter for this spec, bounding tracked sources at `max_tracked`.
+    pub fn build(&self, max_tracked: usize) -> RateLimiter {
+        RateLimiter::new(self.capacity, self.refill_per_ms, max_tracked)
+    }
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FirewallConfig {
-    /// "command" (knockd-compatible, default) or "nftables" (planned).
+    /// "command" (knockd-compatible, default) or "nftables".
     #[serde(default = "default_backend")]
     pub backend: String,
 }
 
 fn default_backend() -> String {
     "command".to_string()
+}
+
+impl Default for FirewallConfig {
+    // Hand-written rather than derived so an omitted `[firewall]` section
+    // defaults `backend` to "command" — a derived Default would leave it the
+    // empty string (serde's field default only fills a missing field of a
+    // *present* table, not a missing whole section).
+    fn default() -> Self {
+        Self {
+            backend: default_backend(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,6 +155,32 @@ impl Config {
             "reset" | "strict" => Ok(MatchMode::Reset),
             other => bail!("unknown matching mode {other:?} (expected \"tolerant\" or \"reset\")"),
         }
+    }
+
+    /// Resolve the worker-shard count: the configured value, or — when `0` —
+    /// auto-detected from available CPUs. Always at least 1.
+    pub fn shard_count(&self) -> usize {
+        match self.matching.shards {
+            0 => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            n => n,
+        }
+    }
+
+    /// Parse the optional `[matching] rate_limit` spec into a [`RateSpec`].
+    pub fn rate_limit(&self) -> Result<Option<RateSpec>> {
+        let Some(raw) = self.matching.rate_limit.as_deref() else {
+            return Ok(None);
+        };
+        Ok(Some(parse_rate(raw).with_context(|| {
+            format!("invalid rate_limit {raw:?} (expected \"<count>/<duration>\", e.g. \"50/10s\")")
+        })?))
+    }
+
+    /// The configured stats endpoint address, if any.
+    pub fn stats_listen(&self) -> Option<&str> {
+        self.stats.listen.as_deref()
     }
 
     /// Validate and lower the parsed config into runtime doors, checking that
@@ -187,6 +266,29 @@ fn parse_port_spec(s: &str) -> Result<PortSpec> {
         bail!("port 0 is not valid in step {s:?}");
     }
     Ok(PortSpec { port, proto })
+}
+
+/// Parse a `"<count>/<duration>"` rate spec into a [`RateSpec`]. The count is the
+/// per-source burst capacity; the sustained refill rate is `count / duration`.
+fn parse_rate(s: &str) -> Result<RateSpec> {
+    let (count_str, dur_str) = s
+        .split_once('/')
+        .with_context(|| format!("rate {s:?} is missing the '/' separator"))?;
+    let count: u32 = count_str
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid count in rate {s:?}"))?;
+    if count == 0 {
+        bail!("rate count must be at least 1 in {s:?}");
+    }
+    let dur_ms = parse_duration_ms(dur_str)?;
+    if dur_ms == 0 {
+        bail!("rate duration must be non-zero in {s:?}");
+    }
+    Ok(RateSpec {
+        capacity: count as f64,
+        refill_per_ms: count as f64 / dur_ms as f64,
+    })
 }
 
 /// Parse a tiny duration grammar: "<n>ms", "<n>s", "<n>m", or bare "<n>" (seconds).
@@ -288,6 +390,70 @@ mod tests {
         let set = doors[0].action.nft_set.as_ref().unwrap();
         assert_eq!(set.set, "knock_clients");
         assert_eq!(doors[0].action.timeout_ms, Some(30_000));
+    }
+
+    #[test]
+    fn parses_rate_limit_spec() {
+        // "50/10s" = burst 50, refill 50 tokens / 10000 ms = 0.005 tokens/ms.
+        let spec = parse_rate("50/10s").unwrap();
+        assert_eq!(spec.capacity, 50.0);
+        assert!((spec.refill_per_ms - 0.005).abs() < 1e-9);
+        // Bad forms are rejected.
+        assert!(parse_rate("50").is_err()); // no separator
+        assert!(parse_rate("0/10s").is_err()); // zero count
+        assert!(parse_rate("10/soon").is_err()); // bad duration
+    }
+
+    #[test]
+    fn matching_section_defaults_and_overrides() {
+        // Defaults: 1 shard, no rate limit, no stats endpoint.
+        let cfg: Config = toml::from_str("interface = \"eth0\"").unwrap();
+        assert_eq!(cfg.shard_count(), 1);
+        assert!(cfg.rate_limit().unwrap().is_none());
+        assert!(cfg.stats_listen().is_none());
+
+        // Explicit overrides round-trip through the accessors.
+        let toml = r#"
+            [matching]
+            shards = 4
+            rate_limit = "20/1s"
+            [stats]
+            listen = "127.0.0.1:9099"
+            [[door]]
+            name = "ssh"
+            sequence = ["7000/tcp"]
+            open_command = "true"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.shard_count(), 4);
+        let spec = cfg.rate_limit().unwrap().unwrap();
+        assert_eq!(spec.capacity, 20.0);
+        assert_eq!(cfg.stats_listen(), Some("127.0.0.1:9099"));
+    }
+
+    #[test]
+    fn omitted_firewall_section_defaults_to_command() {
+        // A config with no [firewall] section must still resolve to the command
+        // backend, not an empty backend string.
+        let toml = r#"
+            [[door]]
+            name = "ssh"
+            sequence = ["7000/tcp"]
+            open_command = "true"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.firewall_kind().unwrap(), FirewallKind::Command);
+    }
+
+    #[test]
+    fn zero_shards_means_auto_detect() {
+        let toml = r#"
+            [matching]
+            shards = 0
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        // Auto-detect resolves to at least one shard on any host.
+        assert!(cfg.shard_count() >= 1);
     }
 
     #[test]
