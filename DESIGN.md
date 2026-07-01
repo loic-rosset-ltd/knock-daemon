@@ -157,6 +157,31 @@ restarts it.
    instead of full root.~~ **Done** — `packaging/systemd/knockd2.service`
    (DynamicUser + AmbientCapabilities + hardening).
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs three jobs:
+
+- **linux** / **macos** — `cargo fmt --check`, `clippy -D warnings`, and the test
+  suite across every feature combo with a code path on that OS (Linux also
+  compiles the `capture-afpacket` backend + cBPF prefilter, which never build on
+  macOS). All pure cores — matcher, sharded routing, rate limiter, frame parser,
+  the cBPF program (via its software interpreter), stats render/HTTP — are
+  covered here.
+- **integration** (`ci/wire-test.sh`, root) — the one slice unit tests can't
+  reach: it runs the release daemon over a real `AF_PACKET` socket on `lo`,
+  attaches the hand-emitted cBPF prefilter to a live kernel via
+  `SO_ATTACH_FILTER`, drives an actual 3-step knock, and asserts the door opened
+  two ways — the source IP landed in the nftables allow-set, and `/metrics`
+  counted the accepted knock. This wire-tests the safety-critical prefilter
+  invariant (the kernel *accepts* the program and does **not** drop real door
+  frames) end to end through capture → parse → shard → match → nftables.
+
+  Not yet asserted: kernel-side drop *efficiency* for non-door frames
+  (`tp_drops`). Measuring it would need the daemon to expose `AF_PACKET`
+  `PACKET_STATISTICS`; until then the integration test proves door frames pass
+  and non-door ports never reach the matcher, but not how many frames the kernel
+  shed before userspace. Tracked as a follow-up.
+
 ## Privileges & threat model
 
 Live capture needs `CAP_NET_RAW`; the nftables backend needs `CAP_NET_ADMIN`. The
