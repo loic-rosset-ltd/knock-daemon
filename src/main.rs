@@ -129,13 +129,20 @@ fn run_live(
         .iter()
         .flat_map(|d| d.spec.sequence.iter().map(|p| p.port))
         .collect();
-    let mut cap = capture::open_live(cfg.interface.clone(), &ports)?;
 
     let firewall = firewall_arc(fw_kind)?;
     let stats = Arc::new(stats::Stats::new(
         doors.iter().map(|d| d.spec.name.clone()).collect(),
         n_shards,
     ));
+
+    // The capture backend reports its kernel-side counters into `stats`, so build
+    // it after the counters exist.
+    let mut cap = capture::open_live(
+        cfg.interface.clone(),
+        &ports,
+        Some(stats.clone() as Arc<dyn capture::KernelStatsSink>),
+    )?;
 
     if let Some(addr) = cfg.stats_listen() {
         stats::serve(addr, stats.clone())?;

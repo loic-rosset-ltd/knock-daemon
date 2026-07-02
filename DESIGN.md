@@ -176,11 +176,15 @@ restarts it.
   invariant (the kernel *accepts* the program and does **not** drop real door
   frames) end to end through capture → parse → shard → match → nftables.
 
-  Not yet asserted: kernel-side drop *efficiency* for non-door frames
-  (`tp_drops`). Measuring it would need the daemon to expose `AF_PACKET`
-  `PACKET_STATISTICS`; until then the integration test proves door frames pass
-  and non-door ports never reach the matcher, but not how many frames the kernel
-  shed before userspace. Tracked as a follow-up.
+  It also asserts the prefilter's drop *efficiency*, using the AF_PACKET
+  `PACKET_STATISTICS` counters the daemon now exposes
+  (`knockd2_afpacket_kernel_packets_total` / `_drops_total`, sampled every ~250ms
+  off the capture socket). `tp_packets` counts only frames that *passed* the
+  filter, so a heavy flood of a non-door port leaves it flat — proving the kernel
+  sheds those frames before the socket queue, not just that userspace ignores
+  them. A successful knock then bumps the same counter, confirming door frames
+  are delivered. This catches a silent prefilter regression the userspace-only
+  "observed" check would miss.
 
 ## Privileges & threat model
 

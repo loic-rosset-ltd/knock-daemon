@@ -10,6 +10,8 @@
 //!
 //! Frame decoding is shared by every live backend in the pure [`parse`] module.
 
+use std::sync::Arc;
+
 use crate::matcher::PacketEvent;
 
 /// A source of knock-relevant packets. Implementations call `sink` once per
@@ -18,6 +20,24 @@ pub trait Capture {
     /// Run the capture loop, invoking `sink` for each event. Blocks until the
     /// source is exhausted (replay) or an error/shutdown occurs (live).
     fn run(&mut self, sink: &mut dyn FnMut(PacketEvent)) -> anyhow::Result<()>;
+}
+
+/// Receives kernel-side capture counters from a live backend. The AF_PACKET
+/// backend periodically samples `PACKET_STATISTICS` and reports here; backends
+/// without kernel counters never call it. Kept as a trait so the capture layer
+/// stays decoupled from the concrete `stats::Stats` type.
+pub trait KernelStatsSink: Send + Sync {
+    /// Fold in a sample: `packets` frames that passed the kernel prefilter and
+    /// `drops` frames it then shed (buffer-full) *since the previous report*.
+    /// Deltas, not totals — the underlying `PACKET_STATISTICS` getsockopt is
+    /// read-and-reset.
+    // Only the AF_PACKET backend calls this; in builds that don't compile it the
+    // sink is created but never fed, so allow the method to look unused there.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "capture-afpacket")),
+        allow(dead_code)
+    )]
+    fn add_kernel_stats(&self, packets: u64, drops: u64);
 }
 
 mod bpf;
@@ -50,14 +70,21 @@ pub use afpacket::AfPacketCapture;
 /// falls back to libpcap (`capture-pcap`), and otherwise reports that the binary
 /// was built without a capture backend. `ports` is the union of door ports, used
 /// for the kernel BPF prefilter (pcap) or userspace filtering (afpacket).
+///
+/// `kstats`, when present, receives the backend's kernel-side capture counters
+/// (AF_PACKET `PACKET_STATISTICS`); backends without such counters ignore it.
 // Each feature/platform combination compiles exactly one arm; the explicit
 // `return`s keep the cfg-gated blocks uniform, so the per-config "needless
 // return" is expected.
 #[allow(unused_variables, clippy::needless_return)]
-pub fn open_live(interface: Option<String>, ports: &[u16]) -> anyhow::Result<Box<dyn Capture>> {
+pub fn open_live(
+    interface: Option<String>,
+    ports: &[u16],
+    kstats: Option<Arc<dyn KernelStatsSink>>,
+) -> anyhow::Result<Box<dyn Capture>> {
     #[cfg(all(target_os = "linux", feature = "capture-afpacket"))]
     {
-        return Ok(Box::new(AfPacketCapture::new(interface, ports)));
+        return Ok(Box::new(AfPacketCapture::new(interface, ports, kstats)));
     }
     #[cfg(all(
         feature = "capture-pcap",

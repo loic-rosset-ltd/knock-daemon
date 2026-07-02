@@ -9,13 +9,20 @@
 # assert the door opened two independent ways: the nftables set gained the source
 # IP, and /metrics counted the accepted knock.
 #
-# What this proves about the cBPF prefilter: the kernel *accepted* the program
-# (log line "attached cBPF prefilter", and no "attach failed" warning), and — the
-# safety-critical invariant — it does NOT drop real door frames (the knock
-# completes end to end). It intentionally does not assert kernel-side drop
-# *efficiency* (tp_drops for non-door frames): that would need the daemon to
-# expose AF_PACKET PACKET_STATISTICS, which it doesn't yet — noted, not silently
-# skipped. See DESIGN.md "Continuous integration".
+# What this proves about the cBPF prefilter:
+#   1. the kernel *accepted* the program (log line "attached cBPF prefilter", no
+#      "attach failed" warning);
+#   2. the safety-critical invariant — it does NOT drop real door frames (the
+#      knock completes end to end, and the kernel's PACKET_STATISTICS shows it
+#      delivered the door frames);
+#   3. drop *efficiency* — it DOES drop non-door frames in the kernel: a heavy
+#      flood of a non-door port leaves the kernel-delivered counter
+#      (PACKET_STATISTICS tp_packets, now exposed on /metrics) flat, because the
+#      prefilter rejects those frames before they reach the socket queue. This
+#      catches a silent prefilter regression that the userspace-only "observed"
+#      check cannot: if the filter stopped working, userspace would still drop
+#      the frames by port, but tp_packets would jump.
+# See DESIGN.md "Continuous integration".
 set -euo pipefail
 
 BIN=./target/release/knockd2
@@ -98,14 +105,29 @@ curl -sf "http://$STATS_ADDR/metrics" >/dev/null 2>&1 || fail "stats endpoint ne
 
 echo "== daemon up, cBPF prefilter attached to the live kernel socket =="
 
-# --- negative check: non-door SYNs never reach the matcher --------------------
+# --- negative check + prefilter drop-efficiency -------------------------------
+# Flood a non-door port. Two invariants must hold:
+#   - userspace never sees the frames (observed unchanged), and
+#   - the KERNEL never even delivers them: PACKET_STATISTICS' tp_packets counts
+#     only frames that PASSED the cBPF filter, so a working prefilter keeps the
+#     exposed kernel counter flat here even under a heavy flood. (If the prefilter
+#     regressed, these frames would be delivered and tp_packets would jump, while
+#     the observed-only check would still pass — hence this stronger assertion.)
+FLOOD=300
 observed_before=$(metric knockd2_packets_observed_total)
-for _ in $(seq 1 20); do knock_port "$NON_DOOR_PORT"; done
-sleep 0.5
+kpkts_before=$(metric knockd2_afpacket_kernel_packets_total)
+for _ in $(seq 1 "$FLOOD"); do knock_port "$NON_DOOR_PORT"; done
+sleep 1  # let the daemon's ~250ms PACKET_STATISTICS poll run at least once
+
 observed_after_noise=$(metric knockd2_packets_observed_total)
 [ "$observed_after_noise" -eq "$observed_before" ] \
   || fail "non-door frames reached the matcher (observed $observed_before -> $observed_after_noise); door-port filtering is broken"
-echo "== non-door SYNs correctly filtered (observed stayed at $observed_before) =="
+
+kpkts_after_noise=$(metric knockd2_afpacket_kernel_packets_total)
+kdelta=$((kpkts_after_noise - kpkts_before))
+[ "$kdelta" -le 5 ] \
+  || fail "kernel delivered $kdelta frames during a ${FLOOD}-connect non-door flood; the cBPF prefilter is not shedding them (expected ~0)"
+echo "== non-door flood shed by the kernel: observed stayed at $observed_before, kernel tp_packets +$kdelta over $FLOOD connects =="
 
 # --- the knock: SYN each door port in order -----------------------------------
 for p in "${DOOR_PORTS[@]}"; do
@@ -129,6 +151,19 @@ accepted=$(metric knockd2_knocks_accepted_total)
 door_accepted=$(curl -s "http://$STATS_ADDR/metrics" \
   | awk -F' ' '/^knockd2_door_accepted_total\{door="ssh"\}/ {print $2}')
 [ "${door_accepted:-0}" -ge 1 ] || fail "per-door counter did not register the ssh knock"
+
+# The kernel must have DELIVERED the door frames it let through — the positive
+# side of the prefilter story, and proof the PACKET_STATISTICS metric is wired
+# and not stuck at zero. Retry: the counter only advances on the daemon's ~250ms
+# poll, which may lag the accept.
+for _ in $(seq 1 20); do
+  kpkts_final=$(metric knockd2_afpacket_kernel_packets_total)
+  [ "${kpkts_final:-0}" -ge 1 ] && break
+  sleep 0.2
+done
+[ "${kpkts_final:-0}" -ge 1 ] \
+  || fail "kernel packet counter never moved even after a successful knock (PACKET_STATISTICS not wired?)"
+echo "== kernel delivered the door frames: knockd2_afpacket_kernel_packets_total=$kpkts_final =="
 
 # The nftables backend must have added the loopback source (127.0.0.1) to the set.
 nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET"

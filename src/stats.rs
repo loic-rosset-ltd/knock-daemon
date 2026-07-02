@@ -25,6 +25,14 @@ pub struct Stats {
     packets_observed: AtomicU64,
     packets_rate_limited: AtomicU64,
     knocks_accepted: AtomicU64,
+    /// Cumulative AF_PACKET `tp_packets` — frames that passed the cBPF prefilter
+    /// and reached the socket (the kernel's total; per `packet(7)` it includes
+    /// any then dropped for a full buffer). Fed by the capture backend via
+    /// [`Stats::add_kernel_stats`]; zero on non-AF_PACKET builds.
+    kernel_packets: AtomicU64,
+    /// Cumulative AF_PACKET `tp_drops` — the subset of the above the kernel then
+    /// dropped because the socket's receive buffer was full.
+    kernel_drops: AtomicU64,
     /// Per-door accepted-knock counts, indexed by door position in the config.
     per_door_accepted: Vec<AtomicU64>,
     /// Door names, parallel to `per_door_accepted`, for metric labels.
@@ -43,6 +51,8 @@ impl Stats {
             packets_observed: AtomicU64::new(0),
             packets_rate_limited: AtomicU64::new(0),
             knocks_accepted: AtomicU64::new(0),
+            kernel_packets: AtomicU64::new(0),
+            kernel_drops: AtomicU64::new(0),
             per_door_accepted,
             door_names,
             tracked_per_shard,
@@ -67,6 +77,21 @@ impl Stats {
         }
     }
 
+    /// Fold in a kernel-side capture-stats sample. `packets`/`drops` are the
+    /// deltas since the previous sample — AF_PACKET's `PACKET_STATISTICS`
+    /// getsockopt is read-and-reset, so the backend reports increments, not
+    /// absolute totals.
+    // Only the AF_PACKET backend feeds this; suppress the unused warning where
+    // that backend isn't compiled (the trait impl below still forwards to it).
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "capture-afpacket")),
+        allow(dead_code)
+    )]
+    pub fn add_kernel_stats(&self, packets: u64, drops: u64) {
+        self.kernel_packets.fetch_add(packets, Ordering::Relaxed);
+        self.kernel_drops.fetch_add(drops, Ordering::Relaxed);
+    }
+
     /// Publish shard `shard`'s current in-flight source count.
     pub fn set_tracked(&self, shard: usize, n: usize) {
         if let Some(slot) = self.tracked_per_shard.get(shard) {
@@ -80,6 +105,8 @@ impl Stats {
             packets_observed: self.packets_observed.load(Ordering::Relaxed),
             packets_rate_limited: self.packets_rate_limited.load(Ordering::Relaxed),
             knocks_accepted: self.knocks_accepted.load(Ordering::Relaxed),
+            kernel_packets: self.kernel_packets.load(Ordering::Relaxed),
+            kernel_drops: self.kernel_drops.load(Ordering::Relaxed),
             per_door: self
                 .door_names
                 .iter()
@@ -102,6 +129,8 @@ pub struct Snapshot {
     pub packets_observed: u64,
     pub packets_rate_limited: u64,
     pub knocks_accepted: u64,
+    pub kernel_packets: u64,
+    pub kernel_drops: u64,
     pub per_door: Vec<(String, u64)>,
     pub tracked_sources: usize,
 }
@@ -132,6 +161,18 @@ pub fn render(s: &Snapshot) -> String {
         "knockd2_knocks_accepted_total",
         "Completed knock sequences across all doors.",
         s.knocks_accepted,
+    );
+    counter(
+        &mut out,
+        "knockd2_afpacket_kernel_packets_total",
+        "Frames that passed the AF_PACKET cBPF prefilter and reached the socket (kernel tp_packets; includes any then buffer-dropped).",
+        s.kernel_packets,
+    );
+    counter(
+        &mut out,
+        "knockd2_afpacket_kernel_drops_total",
+        "Frames dropped by the kernel after the prefilter because the socket receive buffer was full (tp_drops).",
+        s.kernel_drops,
     );
 
     out.push_str("# HELP knockd2_door_accepted_total Completed knocks per door.\n");
@@ -207,6 +248,15 @@ fn handle_conn(mut stream: TcpStream, stats: &Stats) -> std::io::Result<()> {
     stream.write_all(response.as_bytes())
 }
 
+/// Let the capture layer report kernel-side counters without depending on the
+/// concrete [`Stats`] type — it only sees the [`crate::capture::KernelStatsSink`]
+/// interface.
+impl crate::capture::KernelStatsSink for Stats {
+    fn add_kernel_stats(&self, packets: u64, drops: u64) {
+        Stats::add_kernel_stats(self, packets, drops);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,11 +272,17 @@ mod tests {
         stats.record_accepted(1);
         stats.set_tracked(0, 3);
         stats.set_tracked(1, 4);
+        // Kernel-stats samples are deltas (PACKET_STATISTICS is read-and-reset);
+        // successive reports accumulate.
+        stats.add_kernel_stats(5, 1);
+        stats.add_kernel_stats(4, 2);
 
         let snap = stats.snapshot();
         assert_eq!(snap.packets_observed, 2);
         assert_eq!(snap.packets_rate_limited, 1);
         assert_eq!(snap.knocks_accepted, 3);
+        assert_eq!(snap.kernel_packets, 9);
+        assert_eq!(snap.kernel_drops, 3);
         assert_eq!(snap.per_door, vec![("ssh".into(), 2), ("admin".into(), 1)]);
         assert_eq!(snap.tracked_sources, 7);
     }
@@ -247,6 +303,8 @@ mod tests {
             packets_observed: 10,
             packets_rate_limited: 2,
             knocks_accepted: 3,
+            kernel_packets: 42,
+            kernel_drops: 7,
             per_door: vec![("ssh".into(), 3)],
             tracked_sources: 1,
         };
@@ -254,10 +312,12 @@ mod tests {
         assert!(text.contains("knockd2_packets_observed_total 10"));
         assert!(text.contains("knockd2_packets_rate_limited_total 2"));
         assert!(text.contains("knockd2_knocks_accepted_total 3"));
+        assert!(text.contains("knockd2_afpacket_kernel_packets_total 42"));
+        assert!(text.contains("knockd2_afpacket_kernel_drops_total 7"));
         assert!(text.contains("knockd2_door_accepted_total{door=\"ssh\"} 3"));
         assert!(text.contains("knockd2_tracked_sources 1"));
         // Every metric carries a TYPE line.
-        assert_eq!(text.matches("# TYPE ").count(), 5);
+        assert_eq!(text.matches("# TYPE ").count(), 7);
     }
 
     #[test]
@@ -292,6 +352,8 @@ mod tests {
             packets_observed: 0,
             packets_rate_limited: 0,
             knocks_accepted: 0,
+            kernel_packets: 0,
+            kernel_drops: 0,
             per_door: vec![("we\"ird\\door".into(), 0)],
             tracked_sources: 0,
         };
