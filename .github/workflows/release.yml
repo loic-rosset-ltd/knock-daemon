@@ -59,7 +59,11 @@ jobs:
 
       - name: Read crate version
         id: meta
-        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          [ -n "$version" ] || { echo "::error::could not parse version from Cargo.toml"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # Guard: on a tag push, the tag (minus the leading v) must match Cargo.toml.
       - name: Verify tag matches crate version
