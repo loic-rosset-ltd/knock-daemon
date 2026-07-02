@@ -186,6 +186,16 @@ restarts it.
   are delivered. This catches a silent prefilter regression the userspace-only
   "observed" check would miss.
 
+  Finally it wire-tests the daemon's headline differentiator — **per-source
+  isolation under concurrency**. Many clients (distinct `127.0.0.0/8` loopback
+  source addresses, all local on Linux) knock at once with their sequences
+  interleaved step-by-step, so every sequence is mid-flight simultaneously —
+  exactly the load a global-state matcher (classic knockd's weakness) gets wrong.
+  The test asserts each client's door opened independently (every source landed
+  in the allow-set) while one deliberately incomplete client stayed closed,
+  proving state never leaks across the per-source boundary. This turns the
+  unit-tested isolation guarantee into a live, end-to-end one.
+
 ## Privileges & threat model
 
 Live capture needs `CAP_NET_RAW`; the nftables backend needs `CAP_NET_ADMIN`. The

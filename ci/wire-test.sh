@@ -22,6 +22,14 @@
 #      catches a silent prefilter regression that the userspace-only "observed"
 #      check cannot: if the filter stopped working, userspace would still drop
 #      the frames by port, but tp_packets would jump.
+#
+# It then wire-tests the daemon's headline differentiator over classic knockd:
+#   4. per-source isolation under concurrency — many clients (distinct loopback
+#      source IPs) knock at once with their sequences fully interleaved, and each
+#      door still opens for exactly the clients that completed it. A global-state
+#      matcher (knockd's classic weakness) mishandles this; the per-source shards
+#      here don't. An extra client with an incomplete sequence must stay closed,
+#      proving state never leaks across the source boundary.
 # See DESIGN.md "Continuous integration".
 set -euo pipefail
 
@@ -169,5 +177,78 @@ echo "== kernel delivered the door frames: knockd2_afpacket_kernel_packets_total
 nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET"
 nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET" | grep -q "127.0.0.1" \
   || fail "source IP was not added to the nftables allow-set"
+
+# --- concurrent per-source isolation (the daemon's differentiator) ------------
+# Classic knockd tracks knock progress essentially globally and buckles when
+# several clients knock at once with interleaved sequences. knock-daemon keeps
+# per-source-IP state, sharded by source, so simultaneous interleaved knocks each
+# resolve independently. That property is unit-tested; here we prove it live over
+# the wire, driving many clients through one AF_PACKET socket at the same time.
+#
+# Trick: on Linux the whole 127.0.0.0/8 is local, so each 127.0.0.N is an
+# independent client source IP we can bind and knock from — genuinely distinct
+# source addresses on the wire, routed across the matcher's shards.
+#
+# We interleave step by step (every client sends door step 1, THEN every client
+# sends step 2, ...), so at each moment all sequences are simultaneously in
+# flight — exactly the concurrency a global-state matcher gets wrong. One extra
+# "bad" client sends step 1 then step 3, skipping step 2: it must NEVER open, and
+# the burst of step-3 hits from the good clients must not leak into its state.
+GOOD_SRCS=(127.0.0.11 127.0.0.12 127.0.0.13 127.0.0.14 127.0.0.15 127.0.0.16 127.0.0.17 127.0.0.18)
+BAD_SRC=127.0.0.30
+N_GOOD=${#GOOD_SRCS[@]}
+
+accepted_before_concurrent=$(metric knockd2_knocks_accepted_total)
+
+DST=127.0.0.1 GOOD="${GOOD_SRCS[*]}" BAD="$BAD_SRC" PORTS="${DOOR_PORTS[*]}" python3 - <<'PY'
+import os, socket
+dst   = os.environ["DST"]
+good  = os.environ["GOOD"].split()
+bad   = os.environ["BAD"]
+ports = [int(p) for p in os.environ["PORTS"].split()]
+
+def syn(src, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((src, 0))          # any 127.x is a local loopback address on Linux
+        s.settimeout(0.3)
+        s.connect((dst, port))    # closed port -> RST, but the SYN is on the wire
+    except OSError:
+        pass                      # ConnectionRefused/timeout expected; SYN already sent
+    finally:
+        s.close()
+
+# Step-major interleave: all clients advance one step together, so every
+# sequence is mid-flight at the same time.
+for i, port in enumerate(ports):
+    for src in good:
+        syn(src, port)
+    if i != 1:                    # bad client hits step 1 and step 3, never step 2
+        syn(bad, port)
+PY
+
+# Wait for all good clients' knocks to be accepted (the ~250ms poll + matcher lag).
+want=$((accepted_before_concurrent + N_GOOD))
+for _ in $(seq 1 50); do
+  [ "$(metric knockd2_knocks_accepted_total)" -ge "$want" ] && break
+  sleep 0.2
+done
+accepted_now=$(metric knockd2_knocks_accepted_total)
+[ "$accepted_now" -ge "$want" ] \
+  || fail "only $((accepted_now - accepted_before_concurrent))/$N_GOOD interleaved knocks accepted; per-source concurrency is broken"
+
+# Exact-match membership against the allow-set's IPs (avoids 127.0.0.1 matching
+# 127.0.0.11 as a substring). Every good client must be present; the bad one must not.
+set_ips=$(nft list set "$NFT_FAMILY" "$NFT_TABLE" "$NFT_SET" \
+  | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sort -u)
+for src in "${GOOD_SRCS[@]}"; do
+  grep -qxF "$src" <<<"$set_ips" \
+    || fail "interleaved client $src completed its knock but was not added to the allow-set"
+done
+if grep -qxF "$BAD_SRC" <<<"$set_ips"; then
+  fail "incomplete client $BAD_SRC was opened; per-source isolation leaked across sources"
+fi
+echo "== concurrent isolation: all $N_GOOD interleaved clients opened independently; incomplete client stayed closed =="
 
 echo "WIRE-TEST PASS: knock accepted end-to-end (afpacket + cBPF prefilter + matcher + nftables + /metrics)"
