@@ -1,0 +1,149 @@
+name: Release
+
+# Tag a version to cut a release:
+#   git tag v0.1.0 && git push origin v0.1.0
+# builds a self-contained knockd2 for four Linux targets (x86_64 / aarch64,
+# glibc + static musl), packages each as a .tar.gz — plus .deb and .rpm for the
+# glibc targets — checksums everything, and publishes a GitHub Release.
+#
+# `workflow_dispatch` runs the same build for a smoke test but skips publishing.
+#
+# Every binary is built with `--features capture-afpacket`: the pure-Rust
+# AF_PACKET capture backend has no libpcap C dependency, so the artifacts are
+# self-contained (and the musl builds are fully static).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            packages: true
+          - target: aarch64-unknown-linux-gnu
+            packages: true
+          - target: x86_64-unknown-linux-musl
+            packages: false
+          - target: aarch64-unknown-linux-musl
+            packages: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # `cross` builds every target (aarch64 + musl included) in a container with
+      # the right linker/sysroot, so no per-target toolchain wrangling here.
+      - name: Install cross + packaging tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross,cargo-deb,cargo-generate-rpm
+
+      - name: Read crate version
+        id: meta
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+
+      # Guard: on a tag push, the tag (minus the leading v) must match Cargo.toml.
+      - name: Verify tag matches crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="${{ steps.meta.outputs.version }}"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+
+      - name: Build release binary
+        run: cross build --release --locked --target ${{ matrix.target }} --features capture-afpacket
+
+      - name: Stage tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          ver="${{ steps.meta.outputs.version }}"
+          target="${{ matrix.target }}"
+          name="knock-daemon-${ver}-${target}"
+          mkdir -p "dist/${name}"
+          cp "target/${target}/release/knockd2"        "dist/${name}/"
+          cp knockd.toml README.md DESIGN.md            "dist/${name}/"
+          cp LICENSE-MIT LICENSE-APACHE                 "dist/${name}/"
+          cp packaging/systemd/knockd2.service          "dist/${name}/"
+          cp packaging/README.md                        "dist/${name}/PACKAGING.md"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -rf "dist/${name}"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      # .deb / .rpm only for the glibc targets (Alpine/musl uses apk, not these).
+      # cargo-deb / cargo-generate-rpm rewrite the `target/release/...` asset
+      # paths to the per-target dir when given `--target`.
+      - name: Build .deb
+        if: matrix.packages
+        run: cargo deb --no-build --no-strip --target ${{ matrix.target }} --output dist/
+
+      - name: Build .rpm
+        if: matrix.packages
+        run: cargo generate-rpm --target ${{ matrix.target }} --output "dist/knock-daemon-${{ steps.meta.outputs.version }}-${{ matrix.target }}.rpm"
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in *.tar.gz *.deb *.rpm; do
+            [ -e "$f" ] || continue
+            sha256sum "$f" > "${f}.sha256"
+          done
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+          merge-multiple: true
+
+      - name: Collect assets + combined SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find staged -type f ! -name '*.sha256' -exec cp {} out/ \;
+          cd out
+          # Hash into a temp first so SHA256SUMS never lists itself.
+          sha256sum ./* > ../SHA256SUMS
+          mv ../SHA256SUMS .
+          ls -l
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Concurrent port-knocking daemon — a knockd replacement that handles many simultaneous knock sequences without cross-talk."
-license = "UNLICENSED"
-publish = false
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/loic-rosset-ltd/knock-daemon"
+homepage = "https://github.com/loic-rosset-ltd/knock-daemon"
+readme = "README.md"
+keywords = ["port-knocking", "firewall", "security", "networking", "daemon"]
+categories = ["command-line-utilities", "network-programming"]
+authors = ["Loic Rosset <web@mesclefs.com>"]
 
 [[bin]]
 name = "knockd2"
@@ -38,3 +43,65 @@ capture-afpacket = ["dep:libc"]
 lto = true
 strip = true
 panic = "abort"
+
+# --- Packaging ---------------------------------------------------------------
+# Release binaries are built with `--features capture-afpacket`: the pure-Rust
+# AF_PACKET capture path has no libpcap C dependency, so the artifacts are
+# self-contained (and the musl builds are fully static). The nftables and
+# command firewall backends are always compiled in.
+
+# .deb via `cargo deb` (https://github.com/kornelski/cargo-deb).
+[package.metadata.deb]
+maintainer = "Loic Rosset <web@mesclefs.com>"
+copyright = "2026, Loic Rosset"
+license-file = ["LICENSE-MIT", "0"]
+section = "net"
+priority = "optional"
+extended-description = """\
+A concurrent port-knocking daemon for Linux — a knockd replacement that handles \
+many simultaneous knock sequences without cross-talk. In-flight matching state \
+is partitioned per source IP, so any number of clients can knock at once (even \
+the same door, fully interleaved) and each succeeds independently. Ships an \
+nftables firewall backend, a knockd-compatible command backend, a pure-Rust \
+AF_PACKET capture path, and a hardened systemd unit that runs with just \
+CAP_NET_RAW + CAP_NET_ADMIN instead of root."""
+# `target/release/...` asset paths are rewritten to the per-target release dir
+# automatically when cargo-deb is invoked with `--target <triple>`.
+assets = [
+    ["target/release/knockd2", "usr/bin/", "755"],
+    ["knockd.toml", "etc/knock-daemon/knockd.toml", "640"],
+    ["README.md", "usr/share/doc/knock-daemon/README.md", "644"],
+    ["DESIGN.md", "usr/share/doc/knock-daemon/DESIGN.md", "644"],
+    ["packaging/README.md", "usr/share/doc/knock-daemon/PACKAGING.md", "644"],
+    ["LICENSE-APACHE", "usr/share/doc/knock-daemon/LICENSE-APACHE", "644"],
+]
+conf-files = ["/etc/knock-daemon/knockd.toml"]
+recommends = "nftables"
+
+[package.metadata.deb.systemd-units]
+# Installs packaging/systemd/knockd2.service and wires up the standard
+# deb-systemd maintainer scripts — but does NOT enable or start it, so a fresh
+# install never fail-loops before the admin has written a real config.
+unit-scripts = "packaging/systemd"
+unit-name = "knockd2"
+enable = false
+start = false
+
+# .rpm via `cargo generate-rpm` (https://github.com/cat-in-136/cargo-generate-rpm).
+[package.metadata.generate-rpm]
+summary = "Concurrent port-knocking daemon — a knockd replacement without cross-talk."
+assets = [
+    { source = "target/release/knockd2", dest = "/usr/bin/knockd2", mode = "755" },
+    { source = "knockd.toml", dest = "/etc/knock-daemon/knockd.toml", mode = "640", config = true },
+    { source = "packaging/systemd/knockd2.service", dest = "/usr/lib/systemd/system/knockd2.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/knock-daemon/README.md", mode = "644", doc = true },
+    { source = "DESIGN.md", dest = "/usr/share/doc/knock-daemon/DESIGN.md", mode = "644", doc = true },
+    { source = "LICENSE-MIT", dest = "/usr/share/doc/knock-daemon/LICENSE-MIT", mode = "644", doc = true },
+    { source = "LICENSE-APACHE", dest = "/usr/share/doc/knock-daemon/LICENSE-APACHE", mode = "644", doc = true },
+]
+# The unit ships disabled; just refresh systemd's view of it on install/removal.
+post_install_script = "systemctl daemon-reload >/dev/null 2>&1 || true"
+post_uninstall_script = "systemctl daemon-reload >/dev/null 2>&1 || true"
+
+[package.metadata.generate-rpm.recommends]
+nftables = "*"

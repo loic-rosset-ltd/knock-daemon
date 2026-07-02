@@ -5,8 +5,10 @@
 # CAP_NET_ADMIN (let the nftables backend, or a privileged firewall command,
 # touch the ruleset). Everything else is locked down by the hardening block.
 #
-# Install:
-#   install -Dm755 target/release/knockd2 /usr/local/bin/knockd2
+# The .deb / .rpm packages install the binary at /usr/bin/knockd2 and this unit
+# at /usr/lib/systemd/system/knockd2.service. For a manual build, match those
+# paths:
+#   install -Dm755 target/release/knockd2 /usr/bin/knockd2
 #   install -Dm644 packaging/systemd/knockd2.service /etc/systemd/system/knockd2.service
 #   install -Dm600 knockd.toml /etc/knock-daemon/knockd.toml
 #   systemctl daemon-reload && systemctl enable --now knockd2
@@ -23,7 +25,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/knockd2 --config /etc/knock-daemon/knockd.toml
+ExecStart=/usr/bin/knockd2 --config /etc/knock-daemon/knockd.toml
 Restart=on-failure
 RestartSec=2
 

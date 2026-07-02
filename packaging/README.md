@@ -1,5 +1,27 @@
 # Packaging knock-daemon
 
+## Prebuilt packages (recommended)
+
+Every [GitHub release](https://github.com/loic-rosset-ltd/knock-daemon/releases)
+ships `.deb` and `.rpm` packages plus `.tar.gz` archives for `x86_64`/`aarch64`
+(glibc and static musl). The `.deb`/`.rpm` install the binary at
+`/usr/bin/knockd2`, the systemd unit at `/usr/lib/systemd/system/knockd2.service`,
+and an example config at `/etc/knock-daemon/knockd.toml` — but leave the service
+**disabled**, so nothing fail-loops before you've written a real config:
+
+```sh
+sudo dpkg -i knock-daemon_<version>_amd64.deb      # Debian/Ubuntu
+sudo rpm  -i knock-daemon-<version>-*.rpm          # Fedora/RHEL
+
+sudoedit /etc/knock-daemon/knockd.toml
+sudo systemctl enable --now knockd2
+```
+
+These packages are cut by [`.github/workflows/release.yml`](../.github/workflows/release.yml)
+on a `vX.Y.Z` tag; the packaging metadata lives in `Cargo.toml`
+(`[package.metadata.deb]` and `[package.metadata.generate-rpm]`). The sections
+below cover building and installing by hand.
+
 ## systemd (Linux)
 
 [`systemd/knockd2.service`](systemd/knockd2.service) runs the daemon under
@@ -27,7 +49,7 @@ cargo build --release --features capture-afpacket
 # …or libpcap-backed:
 # cargo build --release --features capture-pcap
 
-sudo install -Dm755 target/release/knockd2            /usr/local/bin/knockd2
+sudo install -Dm755 target/release/knockd2            /usr/bin/knockd2
 sudo install -Dm644 packaging/systemd/knockd2.service /etc/systemd/system/knockd2.service
 sudo install -Dm600 knockd.toml                       /etc/knock-daemon/knockd.toml
 

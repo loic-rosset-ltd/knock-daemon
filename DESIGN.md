@@ -156,6 +156,16 @@ restarts it.
 6. ~~systemd unit + capability-based privilege (CAP_NET_RAW + CAP_NET_ADMIN)
    instead of full root.~~ **Done** — `packaging/systemd/knockd2.service`
    (DynamicUser + AmbientCapabilities + hardening).
+7. ~~Release pipeline + distributable packages.~~ **Done** —
+   `.github/workflows/release.yml` cross-builds `knockd2` for four Linux targets
+   (`x86_64`/`aarch64`, glibc + static `musl`) via `cross`, always with
+   `--features capture-afpacket` (no libpcap dependency, so the artifacts are
+   self-contained). Each build is packaged as a `.tar.gz`; the glibc targets also
+   emit `.deb` (`cargo deb`) and `.rpm` (`cargo generate-rpm`) from metadata in
+   `Cargo.toml`. Everything is SHA256-summed and published to a GitHub Release on
+   a `vX.Y.Z` tag. Dual-licensed **MIT OR Apache-2.0** for broad reuse and
+   downstream distro packaging. *(Follow-up: publish to crates.io once the name
+   is claimed and the repo is public.)*
 
 ## Continuous integration
 

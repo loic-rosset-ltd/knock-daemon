@@ -26,6 +26,33 @@ worker threads by source IP, with an optional per-source rate limiter and a
 Prometheus `/metrics` endpoint. See [DESIGN.md](DESIGN.md) for the architecture
 and roadmap.
 
+## Install
+
+Prebuilt, self-contained binaries ship on every
+[GitHub release](https://github.com/loic-rosset-ltd/knock-daemon/releases) for
+`x86_64` and `aarch64` — glibc tarballs, fully static `musl` tarballs, plus
+`.deb` and `.rpm` packages. Each build uses the pure-Rust AF_PACKET capture
+backend, so there's no libpcap dependency to install. Verify a download against
+the release's `SHA256SUMS`.
+
+```sh
+# Debian / Ubuntu
+sudo dpkg -i knock-daemon_<version>_amd64.deb
+
+# Fedora / RHEL
+sudo rpm -i knock-daemon-<version>-x86_64-unknown-linux-gnu.rpm
+
+# Any distro (static musl tarball)
+tar xzf knock-daemon-<version>-x86_64-unknown-linux-musl.tar.gz
+sudo install -Dm755 knock-daemon-*/knockd2 /usr/bin/knockd2
+```
+
+The packages install a hardened, **disabled** systemd unit and an example config
+at `/etc/knock-daemon/knockd.toml`. Edit the config, then
+`sudo systemctl enable --now knockd2`. See [Run as a service](#run-as-a-service).
+
+To build from source instead, see [Run against live traffic](#run-against-live-traffic).
+
 ## Try it (no root, no libpcap)
 
 ```sh
@@ -168,3 +195,19 @@ cargo check --target x86_64-unknown-linux-gnu --features capture-afpacket
 The matcher (`src/matcher.rs`) takes a logical timestamp per event instead of
 reading the clock, so it's fully deterministic and tested without sockets or
 sleeps. See [DESIGN.md](DESIGN.md) for the architecture and rationale.
+
+## Releasing
+
+Push a `vX.Y.Z` tag (matching `Cargo.toml`'s `version`) and
+[`.github/workflows/release.yml`](.github/workflows/release.yml) cross-builds all
+four Linux targets, packages the tarballs / `.deb` / `.rpm`, checksums them, and
+publishes a GitHub Release. `packaging/` metadata lives in `Cargo.toml`
+(`[package.metadata.deb]` / `[package.metadata.generate-rpm]`).
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option. Unless you explicitly state
+otherwise, any contribution you intentionally submit for inclusion in this work,
+as defined in the Apache-2.0 license, shall be dual licensed as above, without
+any additional terms or conditions.
