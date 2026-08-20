@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest a capability.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: "What are you trying to do that you cannot do today? Describe the deployment, not the feature."
+    validations: { required: true }
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do instead today
+      description: "A bastion, a VPN, a wrapper script, knocking each host — whatever it is. This is the bar a new feature has to beat."
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+  - type: checkboxes
+    id: surface
+    attributes:
+      label: Attack surface
+      options:
+        - label: "This would require the daemon to accept inbound connections or parse attacker-supplied input beyond raw packets."
+        - label: "I have read the 'no new inbound network surface' note in CONTRIBUTING.md."

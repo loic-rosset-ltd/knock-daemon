@@ -1,0 +1,51 @@
+name: Bug report
+description: A door that does not open, opens when it should not, or a crash.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For anything with a security dimension, do **not** file here — see
+        [SECURITY.md](../blob/main/SECURITY.md) and use private vulnerability reporting.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`knockd2 --version`, or the commit you built."
+    validations: { required: true }
+  - type: dropdown
+    id: install
+    attributes:
+      label: How was it installed
+      options: [".deb", ".rpm", "musl tarball", "glibc tarball", "built from source"]
+    validations: { required: true }
+  - type: input
+    id: platform
+    attributes:
+      label: Distro and kernel
+      placeholder: "Debian 12, 6.1.0-18-amd64, x86_64"
+    validations: { required: true }
+  - type: dropdown
+    id: backends
+    attributes:
+      label: Backends in use
+      multiple: true
+      options: ["capture-afpacket", "capture-pcap", "firewall: nftables", "firewall: command"]
+  - type: textarea
+    id: config
+    attributes:
+      label: Config
+      description: "Your `knockd.toml` (or `.conf`). Redact hosts/ports if you need to, but keep the structure and timings."
+      render: toml
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: "What you knocked, what you expected the firewall to do, and what it actually did. Include `--check` output and the `[stats]` counters if you have them."
+    validations: { required: true }
+  - type: textarea
+    id: concurrency
+    attributes:
+      label: Was more than one client knocking at the time?
+      description: "Concurrency is this daemon's whole point, so this matters. How many sources, and were their sequences interleaved?"

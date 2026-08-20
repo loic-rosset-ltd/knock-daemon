@@ -183,6 +183,16 @@ daemon under a `DynamicUser` with only `CAP_NET_RAW` (capture) and
 `CAP_NET_ADMIN` (firewall) — no root — plus a hardening sandbox. See
 [`packaging/README.md`](packaging/README.md) for install and verification steps.
 
+## Contributing & security
+
+Bug reports and patches are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for
+the build/test loop and the two rules that matter (the matcher stays pure; no new
+inbound network surface).
+
+**Security issues go through private vulnerability reporting, never a public
+issue** — see [SECURITY.md](SECURITY.md), which also spells out what port
+knocking does and does not protect against.
+
 ## Development
 
 ```sh

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/loic-rosset-ltd/knock-daemon/security/advisories/new
+    about: Report privately. Never in a public issue.
+  - name: Migrating from knockd
+    url: https://github.com/loic-rosset-ltd/knock-daemon/blob/main/DESIGN.md
+    about: Classic knockd.conf files are parsed directly — see DESIGN.md for the differences in matching behaviour.
