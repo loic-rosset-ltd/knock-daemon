@@ -138,10 +138,16 @@ impl Matcher {
             if expected.port == ev.port && expected.proto == ev.proto {
                 a.stage += 1;
                 if a.stage == seq.len() {
-                    completed.push(Completed {
-                        door: a.door,
-                        src: ev.src,
-                    });
+                    let door = a.door;
+                    // One packet opens a door once. Several candidates for the
+                    // same door can be in flight at the same stage (that is the
+                    // point of tracking a set — a retry or a retransmit starts
+                    // another one), and the final hit completes all of them.
+                    // Report the door once, not once per candidate, so the
+                    // firewall command does not run twice for a single knock.
+                    if !completed.iter().any(|c: &Completed| c.door == door) {
+                        completed.push(Completed { door, src: ev.src });
+                    }
                     entry.remove(i);
                     continue; // don't advance `i`; the next element shifted down
                 }
@@ -155,6 +161,13 @@ impl Matcher {
                 continue;
             }
             i += 1;
+        }
+
+        // 2b. A door that just opened for this source has no use for its other
+        //     in-flight candidates; drop them so a duplicate of the final
+        //     packet cannot re-open the same door.
+        if !completed.is_empty() {
+            entry.retain(|a| !completed.iter().any(|c| c.door == a.door));
         }
 
         // 3. Open a fresh attempt for every door whose first step matches. This
@@ -514,6 +527,29 @@ mod tests {
         }
         // n_shards = 0 is treated as 1.
         assert_eq!(shard_for(&ip(1), 0), 0);
+    }
+
+    #[test]
+    fn duplicate_opening_packet_opens_the_door_exactly_once() {
+        // A retry or a TCP retransmit of the first step starts a second
+        // candidate alongside the first — that is what keeps the knock alive.
+        // Both candidates then complete on the same final packet, and the door
+        // must still be reported once, or the firewall command runs twice.
+        let mut m = Matcher::new(vec![door("ssh", &[7000, 8000, 9000], 10_000)]);
+        let src = ip(10);
+
+        assert!(m.process(ev(src, 7000, 0)).is_empty());
+        assert!(m.process(ev(src, 7000, 5)).is_empty()); // the duplicate
+        assert!(m.process(ev(src, 8000, 10)).is_empty());
+
+        let done = m.process(ev(src, 9000, 15));
+        assert_eq!(done.len(), 1, "one packet must open the door once");
+        assert_eq!(done[0].door, 0);
+        assert_eq!(done[0].src, src);
+
+        // Nothing is left over that a repeat of the final packet could re-open.
+        assert!(m.process(ev(src, 9000, 20)).is_empty());
+        assert_eq!(m.tracked_sources(), 0);
     }
 
     #[test]

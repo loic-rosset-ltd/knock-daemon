@@ -345,7 +345,7 @@
 
         <div class="install-line">
           <span class="p">$</span><code>cargo run -- --demo</code>
-          <span class="muted" style="margin-left:auto;">two clients, one door</span>
+          <span class="muted" style="margin-left:auto;">a duplicate packet, survived</span>
         </div>
 
         <div class="cta-row">
@@ -523,15 +523,20 @@
             <span class="dot" style="background:#5FD08A"></span>
             <span>knockd2 — demo</span>
           </div>
-          <div class="body"><pre><span class="cm"># prove the concurrency, no privileges needed</span>
+          <div class="body"><pre><span class="cm"># real output, timestamps trimmed. no privileges needed</span>
 <span class="pr">$</span> cargo run -- <span class="ke">--demo</span>
 
-<span class="out">  client</span> <span class="st">10.0.0.14</span> <span class="out">→ 7000 …… 8000 …… 9000</span>
-<span class="out">  client</span> <span class="st">10.0.0.27</span> <span class="out">→ 7000 … 8000 …… 9000</span>
-<span class="out">  packets fully interleaved on the wire</span>
-
-<span class="ok">  ✓ 10.0.0.14  door "ssh" opened</span>
-<span class="ok">  ✓ 10.0.0.27  door "ssh" opened</span>
+<span class="out">--- knock-daemon demo: a duplicated opening packet,</span>
+<span class="out">    and two interleaved clients ---</span>
+<span class="out"> INFO knockd2: knock accepted door=ssh src=</span><span class="st">203.0.113.20</span>
+<span class="out"> INFO knockd2::firewall::command: running firewall command</span>
+<span class="out">      command=echo would-open </span><span class="st">203.0.113.20</span>
+<span class="ok">would-open 203.0.113.20</span>
+<span class="out"> INFO knockd2: knock accepted door=ssh src=</span><span class="st">203.0.113.10</span>
+<span class="out"> INFO knockd2::firewall::command: running firewall command</span>
+<span class="out">      command=echo would-open </span><span class="st">203.0.113.10</span>
+<span class="ok">would-open 203.0.113.10</span>
+<span class="out">--- both accepted; the duplicate did not end .10's sequence ---</span>
 
 <span class="cm"># validate a real config</span>
 <span class="pr">$</span> cargo run -- <span class="ke">--check</span> <span class="ke">--config</span> knockd.toml</pre></div>
