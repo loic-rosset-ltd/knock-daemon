@@ -124,6 +124,45 @@ impl AfPacketCapture {
         }
     }
 
+    /// Ask the kernel not to deliver frames this host *sent*.
+    ///
+    /// `ETH_P_ALL` delivers both directions, so without this the daemon sees its
+    /// own outbound traffic — and on `lo` it sees every frame twice, outbound and
+    /// looped back. A knock observed twice is not harmless: in `reset` mode the
+    /// second copy of a step looks exactly like a stray hit to a monitored port
+    /// and aborts the attempt, so the door never opens at all. (Install-rehearsal
+    /// finding F-05, where a loopback knock also ran `open_command` twice.)
+    ///
+    /// `PACKET_IGNORE_OUTGOING` is Linux 4.20+. On an older kernel the
+    /// `setsockopt` fails with `ENOPROTOOPT`; we log it and carry on, because the
+    /// duplicate-delivery case it prevents is a correctness annoyance on `lo`
+    /// rather than a way to get a door open that shouldn't be.
+    fn ignore_outgoing(&self, fd: i32) {
+        // Not in the libc crate for every target/version we build against.
+        const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
+        let on: libc::c_int = 1;
+        // SAFETY: the option takes an `int`, which is what we pass and size.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_PACKET,
+                PACKET_IGNORE_OUTGOING,
+                &on as *const libc::c_int as *const c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            tracing::warn!(
+                error = %Error::last_os_error(),
+                "PACKET_IGNORE_OUTGOING unavailable (needs Linux 4.20+); this host's \
+                 own outbound frames will also be captured, and on a loopback \
+                 interface every frame is seen twice"
+            );
+        } else {
+            tracing::debug!("ignoring outbound frames (PACKET_IGNORE_OUTGOING)");
+        }
+    }
+
     /// Set a receive timeout so `recv` wakes every [`STATS_POLL_INTERVAL`] even
     /// with no traffic, letting the loop sample kernel stats while the prefilter
     /// is dropping every frame. Best-effort — only relevant when reporting stats.
@@ -249,6 +288,7 @@ impl Capture for AfPacketCapture {
             return Err(anyhow!(Error::last_os_error())).context("binding AF_PACKET socket");
         }
 
+        self.ignore_outgoing(socket.0);
         self.attach_prefilter(socket.0);
         self.set_poll_timeout(socket.0);
 
