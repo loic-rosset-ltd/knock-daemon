@@ -32,6 +32,18 @@ worker threads by source IP, with an optional per-source rate limiter and a
 Prometheus `/metrics` endpoint. See [DESIGN.md](DESIGN.md) for the architecture
 and roadmap.
 
+## When this is the wrong tool
+
+If you can run WireGuard or Tailscale, run WireGuard or Tailscale. They authenticate; this
+does not. Port knocking earns its place where you can't: an appliance or embedded client that
+can only open a TCP connection, a network where you aren't allowed to install a VPN client, or
+as one more thing in front of a service that already authenticates its users.
+
+What it reliably buys you is that your SSH port stops appearing in scans and your auth log
+stops filling with credential-stuffing attempts. Treat it as that, not as a lock. The sequence
+travels in cleartext, so anyone on the path can record and replay it — [SECURITY.md](SECURITY.md)
+sets out what is and isn't in scope, without hedging.
+
 ## Install
 
 Prebuilt, self-contained binaries ship on every
@@ -96,6 +108,46 @@ If both features are built in, the AF_PACKET backend is preferred. Capture needs
 
 TOML — see [`knockd.toml`](knockd.toml). A door is an ordered port sequence that,
 completed within `seq_timeout`, opens access for the source IP.
+
+### First, the rule that makes a door mean anything
+
+**Without a rule that blocks the port by default, knock-daemon changes nothing.** It only ever
+adds a source to an allow-set; if nothing else is denying that port, the port was already open
+and the knock bought you exactly nothing. Set the deny rule up first and confirm the port is
+unreachable *before* you configure a single door.
+
+A complete `nftables` ruleset that does this, with `knock_clients` as the set a door adds to:
+
+```nft
+table inet filter {
+  set knock_clients {
+    type ipv4_addr
+    flags timeout
+  }
+
+  chain input {
+    type filter hook input priority 0; policy drop;
+
+    ct state established,related accept
+    iif lo accept
+
+    tcp dport 22 ip saddr @knock_clients accept
+  }
+}
+```
+
+Load it with `sudo nft -f <file>`, and persist it the way your distribution expects
+(`/etc/nftables.conf` on Debian/Ubuntu).
+
+> 🔴 **`policy drop` will lock you out of a remote machine** if you apply it without an accept
+> rule matching how you are currently connected. Keep a second SSH session open while you test,
+> or work from a console you cannot lose. The `ct state established,related` line keeps your
+> *current* session alive; it does nothing for the next one.
+
+The set is IPv4-only as written. For IPv6 clients add a second set
+(`type ipv6_addr`) and a matching `tcp dport 22 ip6 saddr @... accept` rule.
+
+### Then the doors
 
 With the default **`command`** backend a door runs `open_command` (with `%IP%`
 substituted), optionally auto-undone by `close_command` after `cmd_timeout`:

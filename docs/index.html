@@ -323,6 +323,7 @@
     <span class="spacer"></span>
     <a class="navlink" href="#problem">The problem</a>
     <a class="navlink" href="#how">How it works</a>
+    <a class="navlink" href="#scope">Scope</a>
     <a class="navlink" href="#install">Install</a>
     <a class="navlink" href="#config">Config</a>
     <a class="gh" href="https://github.com/loic-rosset-ltd/knock-daemon">GitHub ↗</a>
@@ -453,6 +454,59 @@
           <h3>Grant access</h3>
           <p>The <code>nftables</code> backend adds the source to an allow-set with a kernel-side timeout; or the <code>command</code> backend runs your shell with <code>%IP%</code>.</p>
         </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SCOPE ============ -->
+  <section id="scope">
+    <div class="wrap">
+      <div class="sec-head">
+        <span class="eyebrow">Honest scope</span>
+        <h2>If you can run WireGuard, run WireGuard.</h2>
+        <p>
+          A VPN authenticates. This does not. The sequence travels in cleartext on the
+          wire, so anyone positioned to watch it can record it and replay it. Port
+          knocking is obfuscation, and it is worth having for exactly the reasons
+          obfuscation is worth having &mdash; no more than that.
+        </p>
+      </div>
+
+      <div class="versus">
+        <div class="vpanel">
+          <span class="vtag">Use a VPN when</span>
+          <h3>You control both ends</h3>
+          <p>
+            WireGuard or Tailscale on both ends beats this outright, and it is not close.
+            If the constraint that pushed you here is one you can spend your way out of,
+            spend your way out of it instead.
+          </p>
+        </div>
+
+        <div class="vpanel">
+          <span class="vtag">Use knocking when</span>
+          <h3>You can only open a socket</h3>
+          <p>
+            An appliance or embedded client that can do nothing but connect, a network
+            where you are not allowed to install a VPN client, or one more obstacle in
+            front of a service that already authenticates its users. What you reliably
+            get: the port stops showing up in scans, and the auth log stops filling with
+            credential stuffing.
+          </p>
+        </div>
+      </div>
+
+      <div class="sec-head" style="margin-top:28px;">
+        <p>
+          One thing nobody tells you until it has already cost you an afternoon:
+          <b>knock-daemon only ever adds a source to an allow-set.</b> If no rule denies
+          that port by default, the port was open the whole time and the knock bought you
+          nothing. Set the deny rule up first &mdash; the
+          <a href="https://github.com/loic-rosset-ltd/knock-daemon#first-the-rule-that-makes-a-door-mean-anything">README
+          gives a complete ruleset</a> &mdash; and read
+          <a href="https://github.com/loic-rosset-ltd/knock-daemon/blob/main/SECURITY.md">SECURITY.md</a>
+          for what is and isn't in scope.
+        </p>
       </div>
     </div>
   </section>
@@ -660,6 +714,7 @@
     <a href="https://github.com/loic-rosset-ltd/knock-daemon/releases">Releases</a>
     <a href="#install">Install</a>
     <a href="#config">Config</a>
+    <a href="https://github.com/loic-rosset-ltd/knock-daemon/blob/main/SECURITY.md">Security</a>
     <span class="lic">MIT OR Apache-2.0</span>
   </div>
 </footer>
