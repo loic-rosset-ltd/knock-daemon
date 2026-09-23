@@ -21,13 +21,22 @@ front-end; this daemon is the server side it knocks against.
 
 ## Status
 
+**v0.1.0 — first public release. No known production deployments, no external
+users yet.** The matcher is heavily unit-tested and the packages are rehearsed on
+fresh Debian and AlmaLinux systems, but nobody outside this repository has run
+this against real traffic. It touches your firewall and it captures packets;
+weigh that accordingly, and read [SECURITY.md](SECURITY.md) before you deploy it
+in front of anything you care about.
+
 The **concurrent matcher is real and unit-tested**. Live capture has two
 backends — a pure-Rust `AF_PACKET` path (`capture-afpacket`, no libpcap) and a
 libpcap path (`capture-pcap`) — sharing a unit-tested frame decoder
 (IPv4/IPv6/VLAN/QinQ). Both firewall backends ship: `command` (knockd-style) and
-`nftables` (allow-set element with a kernel-side timeout). Classic knockd
-`.conf` files are parsed for drop-in migration, and a systemd unit runs the
-daemon with `CAP_NET_RAW`/`CAP_NET_ADMIN` instead of root. Matching shards across
+`nftables` (allow-set element with a kernel-side timeout). The common subset of classic
+knockd `.conf` files is parsed directly (see
+[Migrating from knockd](#migrating-from-knockd) for what is and isn't covered),
+and a systemd unit runs the daemon with `CAP_NET_RAW`/`CAP_NET_ADMIN` instead of
+root. Matching shards across
 worker threads by source IP, with an optional per-source rate limiter and a
 Prometheus `/metrics` endpoint. See [DESIGN.md](DESIGN.md) for the architecture
 and roadmap.
@@ -50,8 +59,12 @@ Prebuilt, self-contained binaries ship on every
 [GitHub release](https://github.com/loic-rosset-ltd/knock-daemon/releases) for
 `x86_64` and `aarch64` — glibc tarballs, fully static `musl` tarballs, plus
 `.deb` and `.rpm` packages. Each build uses the pure-Rust AF_PACKET capture
-backend, so there's no libpcap dependency to install. Verify a download against
-the release's `SHA256SUMS`.
+backend, so there's no libpcap dependency to install.
+
+Each release ships a `SHA256SUMS` file. Check your download against it — but note
+what that does and does not prove: the checksums are published alongside the
+artifacts they cover, so they catch a corrupted or truncated download, not a
+compromised release. Signed releases are on the roadmap.
 
 ```sh
 # Debian / Ubuntu
@@ -65,6 +78,11 @@ tar xzf knock-daemon-<version>-x86_64-unknown-linux-musl.tar.gz
 sudo install -Dm755 knock-daemon-*/knockd2 /usr/bin/knockd2
 ```
 
+**Three names, one thing:** the package is `knock-daemon`, the binary and the
+systemd service are both `knockd2`, and the config lives in
+`/etc/knock-daemon/knockd.toml`. `systemctl status knock-daemon` will tell you
+nothing exists; the unit is `knockd2`.
+
 The packages install a hardened, **disabled** systemd unit and an example config
 at `/etc/knock-daemon/knockd.toml`. Edit the config, then
 `sudo systemctl enable --now knockd2`. See [Run as a service](#run-as-a-service).
@@ -74,17 +92,22 @@ To build from source instead, see [Run against live traffic](#run-against-live-t
 ## Try it (no root, no libpcap)
 
 ```sh
-cargo run -- --demo
+knockd2 --demo
 ```
 
-Replays two clients knocking the same door with fully interleaved packets and
-shows both accepted independently — the exact case classic knockd mishandles.
+Replays one client whose opening packet arrives twice — a retry or a TCP
+retransmit — alongside a second client knocking interleaved throughout. Both are
+accepted. The duplicate is the interesting part: it is what ends an in-flight
+knockd sequence without starting another.
 
-Validate a config:
+Validate a config before you enable the service:
 
 ```sh
-cargo run -- --check --config knockd.toml
+knockd2 --check --config /etc/knock-daemon/knockd.toml
 ```
+
+(From a source checkout, both are `cargo run -- --demo` and
+`cargo run -- --check --config knockd.toml`.)
 
 ## Run against live traffic
 
@@ -149,13 +172,19 @@ The set is IPv4-only as written. For IPv6 clients add a second set
 
 ### Then the doors
 
+🔴 **Never use a sequence in ascending port order.** An ordinary ascending port
+scan walks `7000, 8000, 9000` in exactly that order, and completes a door built
+on them inside `seq_timeout` having known nothing — in `reset` mode as much as in
+`tolerant`. The examples here are deliberately not monotonic. Pick your ports at
+random, not by pattern, and keep them out of order.
+
 With the default **`command`** backend a door runs `open_command` (with `%IP%`
 substituted), optionally auto-undone by `close_command` after `cmd_timeout`:
 
 ```toml
 [[door]]
 name = "ssh"
-sequence = ["7000/tcp", "8000/udp", "9000/tcp"]
+sequence = ["41953/tcp", "8271/udp", "22986/tcp"]
 seq_timeout = "10s"
 open_command  = "nft add element inet filter knock_clients { %IP% }"
 close_command = "nft delete element inet filter knock_clients { %IP% }"
@@ -173,7 +202,7 @@ backend = "nftables"
 
 [[door]]
 name = "ssh"
-sequence = ["7000/tcp", "8000/udp", "9000/tcp"]
+sequence = ["41953/tcp", "8271/udp", "22986/tcp"]
 seq_timeout = "10s"
 nft_set = "inet filter knock_clients"   # "<family> <table> <set>"; family defaults to inet
 cmd_timeout = "30s"                       # kernel-side element timeout
@@ -195,6 +224,22 @@ aborts the attempt:
 mode = "tolerant"   # default; or "reset" for knockd-style reset-on-stray
 ```
 
+On Linux the AF_PACKET backend sets `PACKET_IGNORE_OUTGOING`, so the daemon never
+sees this host's own outbound frames. That matters most in `reset` mode: on an
+interface that observes its own traffic — `lo` above all — every frame is seen
+twice, the second copy looks exactly like a stray hit to a monitored port, and
+`reset` aborts on it, so the door never opens. On a kernel older than 4.20 the
+option is unavailable and the daemon logs a warning at startup; prefer `tolerant`
+there, or capture on a real interface.
+
+**`reset` is not the more secure mode, and `tolerant` does not trade security for
+robustness.** It is natural to assume otherwise. But `reset` also starts a fresh
+attempt whenever a door's first port is hit, so an attacker who knows which three
+ports a door uses opens it in either mode with the same short burst covering
+every ordering. What `reset` buys is knockd parity; what `tolerant` buys is that
+a retransmit doesn't cost you a knock. Neither changes what an attacker has to
+guess — the ports, and their order.
+
 ### Scaling, rate limiting, and metrics
 
 Matching is partitioned by source IP across worker threads, so concurrent clients
@@ -204,7 +249,7 @@ Prometheus counters:
 
 ```toml
 [matching]
-shards = 0              # worker threads; 1 = single-threaded, 0 = auto-detect CPUs
+shards = 1              # worker threads; 1 = single-threaded (default), 0 = auto-detect CPUs
 rate_limit = "50/10s"   # per source IP: burst of 50, refilling 50 per 10s (omit = unlimited)
 
 [stats]
@@ -234,10 +279,17 @@ the `command` firewall backend, `port:proto` steps become `port/proto`, and the
 matcher defaults to `reset` mode to mirror knockd's behaviour. See
 [`examples/knockd.conf`](examples/knockd.conf).
 
+**It is the common subset, not a drop-in.** `one_time_sequences`, a per-door
+`TARGET`, the IPv6 `start_command_6` / `stop_command_6` variants and any
+`tcpflags` other than `syn` are not supported — and a config using them is
+**rejected at load rather than ignored**. That is deliberate: silently dropping
+`one_time_sequences` would delete replay protection you currently have without
+telling you. `--check` tells you before the service does.
+
 ## Run as a service
 
 [`packaging/systemd/knockd2.service`](packaging/systemd/knockd2.service) runs the
-daemon under a `DynamicUser` with only `CAP_NET_RAW` (capture) and
+daemon as a dedicated `knockd2` system user with only `CAP_NET_RAW` (capture) and
 `CAP_NET_ADMIN` (firewall) — no root — plus a hardening sandbox. See
 [`packaging/README.md`](packaging/README.md) for install and verification steps.
 
@@ -257,6 +309,7 @@ knocking does and does not protect against.
 cargo test                              # matcher, frame parser, config + knockd tests
 cargo check --features capture-pcap     # type-check the libpcap path
 # The AF_PACKET backend is Linux-only; type-check it from any host with:
+rustup target add x86_64-unknown-linux-gnu    # once
 cargo check --target x86_64-unknown-linux-gnu --features capture-afpacket
 ```
 

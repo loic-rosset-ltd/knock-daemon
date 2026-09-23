@@ -25,11 +25,20 @@ Documentation=https://github.com/loic-rosset-ltd/knock-daemon
 After=network-online.target nftables.service
 Wants=network-online.target
 
+# Without a limit, a config the daemon refuses to load becomes a tight restart
+# loop that fills the journal. Give up after 5 failures in 60s and stay failed,
+# so `systemctl status` shows the real error rather than the latest retry.
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/knockd2 --config /etc/knock-daemon/knockd.toml
 Restart=on-failure
 RestartSec=2
+# NOTE: the rate limit for the above lives in [Unit] as StartLimitBurst= /
+# StartLimitIntervalSec= — they are unit-level keys, and systemd ignores them
+# with a warning if they are put here.
 
 # --- Privilege: capabilities instead of root -------------------------------
 # Run as a dedicated unprivileged system user, granting just the two

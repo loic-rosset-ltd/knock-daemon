@@ -345,7 +345,7 @@
         </p>
 
         <div class="install-line">
-          <span class="p">$</span><code>cargo run -- --demo</code>
+          <span class="p">$</span><code>knockd2 --demo</code>
           <span class="muted" style="margin-left:auto;">a duplicate packet, survived</span>
         </div>
 
@@ -399,7 +399,7 @@
             you have not restarted; you have ended the knock.
           </p>
           <div class="diagram">
-            <span class="src">A</span> :7000 → <span class="src">A</span> :7000 <span class="muted">(retransmit)</span><br>
+            <span class="src">A</span> :41953 → <span class="src">A</span> :41953 <span class="muted">(retransmit)</span><br>
             attempt&nbsp;→&nbsp;stage 1 → <span class="hl-bad">✗ stage = -1, discarded</span><br>
             <span class="hl-bad">the door never opens, and nothing says why</span>
           </div>
@@ -415,7 +415,7 @@
             Set <code>mode = "reset"</code>.
           </p>
           <div class="diagram">
-            <span class="src">A</span> :7000 → <span class="src">A</span> :7000 <span class="muted">(retransmit)</span><br>
+            <span class="src">A</span> :41953 → <span class="src">A</span> :41953 <span class="muted">(retransmit)</span><br>
             candidate 1 → stage 1 &nbsp;·&nbsp; candidate 2 → stage 1<br>
             <span class="hl-good">either one completes the sequence — door opens</span>
           </div>
@@ -550,11 +550,11 @@
         </div>
         <div class="feat">
           <div class="fh"><span class="mark">◆</span> Memory-safe Rust</div>
-          <p>A root-adjacent network daemon with no GC and no C parsing surface of its own. Rust 1.80+.</p>
+          <p>A root-adjacent network daemon with no GC. The released builds use the pure-Rust <code>AF_PACKET</code> backend, so they link no C capture library at all — the optional libpcap backend is the one exception, and it is not what ships. Rust 1.80+.</p>
         </div>
         <div class="feat">
           <div class="fh"><span class="mark">◆</span> Prove it offline</div>
-          <p><code>--demo</code> replays interleaved clients with no root and no capture; <code>--check</code> validates a config.</p>
+          <p><code>--demo</code> replays a duplicated opening packet alongside interleaved clients, with no root and no capture; <code>--check</code> validates a config.</p>
         </div>
       </div>
     </div>
@@ -566,7 +566,7 @@
       <div class="sec-head">
         <span class="eyebrow">Install</span>
         <h2>See the interleaving in one command.</h2>
-        <p>No root, no libpcap, nothing to capture — <code>--demo</code> replays two clients knocking the same door with fully interleaved packets and shows both accepted. The exact case classic knockd mishandles.</p>
+        <p>No root, no libpcap, nothing to capture. <code>--demo</code> prints the packet stream as the capture layer sees it — two clients interleaved, one of them sending its opening packet twice — and then both doors opening. The duplicate is the part that matters: it is what ends an in-flight knockd sequence without starting another.</p>
       </div>
 
       <div class="term-grid">
@@ -578,22 +578,38 @@
             <span>knockd2 — demo</span>
           </div>
           <div class="body"><pre><span class="cm"># real output, timestamps trimmed. no privileges needed</span>
-<span class="pr">$</span> cargo run -- <span class="ke">--demo</span>
+<span class="pr">$</span> knockd2 <span class="ke">--demo</span>
 
 <span class="out">--- knock-daemon demo: a duplicated opening packet,</span>
 <span class="out">    and two interleaved clients ---</span>
+<span class="out">door "ssh" = :41953 → :8271 → :22986 (seq_timeout 10s,</span>
+<span class="out">    mode = tolerant)</span>
+
+<span class="out">  replayed packets, in the order the capture layer sees them:</span>
+<span class="out">  t=  0ms  </span><span class="st">203.0.113.10</span><span class="out">   → :41953  [ssh 1/3]</span>
+<span class="out">  t=  5ms  </span><span class="st">203.0.113.20</span><span class="out">   → :41953  [ssh 1/3]</span>
+<span class="out">  t=  9ms  </span><span class="st">203.0.113.10</span><span class="out">   → :41953  [ssh 1/3]   &lt;-- duplicate</span>
+<span class="out">  t= 12ms  </span><span class="st">203.0.113.20</span><span class="out">   → :8271   [ssh 2/3]</span>
+<span class="out">  t= 18ms  </span><span class="st">203.0.113.10</span><span class="out">   → :8271   [ssh 2/3]</span>
+<span class="out">  t= 25ms  </span><span class="st">203.0.113.20</span><span class="out">   → :22986  [ssh 3/3]</span>
 <span class="out"> INFO knockd2: knock accepted door=ssh src=</span><span class="st">203.0.113.20</span>
 <span class="out"> INFO knockd2::firewall::command: running firewall command</span>
 <span class="out">      command=echo would-open </span><span class="st">203.0.113.20</span>
 <span class="ok">would-open 203.0.113.20</span>
+<span class="out">  t= 31ms  </span><span class="st">203.0.113.10</span><span class="out">   → :22986  [ssh 3/3]</span>
 <span class="out"> INFO knockd2: knock accepted door=ssh src=</span><span class="st">203.0.113.10</span>
 <span class="out"> INFO knockd2::firewall::command: running firewall command</span>
 <span class="out">      command=echo would-open </span><span class="st">203.0.113.10</span>
 <span class="ok">would-open 203.0.113.10</span>
-<span class="out">--- both accepted; the duplicate did not end .10's sequence ---</span>
+
+<span class="out">--- both sources completed the door. Note .10's opening</span>
+<span class="out">    packet arrived twice (t=0ms, t=9ms): classic knockd</span>
+<span class="out">    discards the in-flight attempt on that duplicate and</span>
+<span class="out">    starts nothing in its place, so .10 would never have</span>
+<span class="out">    opened. ---</span>
 
 <span class="cm"># validate a real config</span>
-<span class="pr">$</span> cargo run -- <span class="ke">--check</span> <span class="ke">--config</span> knockd.toml</pre></div>
+<span class="pr">$</span> knockd2 <span class="ke">--check</span> <span class="ke">--config</span> /etc/knock-daemon/knockd.toml</pre></div>
         </div>
 
         <div class="steps">
@@ -649,7 +665,7 @@
 
 <span class="sec">[[door]]</span>
 <span class="key">name</span>        = <span class="str">"ssh"</span>
-<span class="key">sequence</span>    = [<span class="str">"7000/tcp"</span>, <span class="str">"8000/udp"</span>, <span class="str">"9000/tcp"</span>]
+<span class="key">sequence</span>    = [<span class="str">"41953/tcp"</span>, <span class="str">"8271/udp"</span>, <span class="str">"22986/tcp"</span>]
 <span class="key">seq_timeout</span> = <span class="str">"10s"</span>
 <span class="key">nft_set</span>     = <span class="str">"inet filter knock_clients"</span>
 <span class="key">cmd_timeout</span> = <span class="str">"30s"</span>   <span class="cm"># element lifetime</span></pre>
@@ -657,17 +673,26 @@
 
         <div class="cfg">
           <div class="ch"><b>command backend</b><span class="tag">knockd-compatible</span></div>
-          <p class="desc">Runs your shell with <code>%IP%</code> substituted, and can auto-undo it after <code>cmd_timeout</code>. Drop-in for existing knockd recipes.</p>
+          <p class="desc">Runs your shell with <code>%IP%</code> substituted, and can auto-undo it after <code>cmd_timeout</code>. Takes existing knockd recipes as they are.</p>
 <pre><span class="cm"># knockd.toml</span>
 <span class="sec">[[door]]</span>
 <span class="key">name</span>          = <span class="str">"ssh"</span>
-<span class="key">sequence</span>      = [<span class="str">"7000/tcp"</span>, <span class="str">"8000/udp"</span>, <span class="str">"9000/tcp"</span>]
+<span class="key">sequence</span>      = [<span class="str">"41953/tcp"</span>, <span class="str">"8271/udp"</span>, <span class="str">"22986/tcp"</span>]
 <span class="key">seq_timeout</span>   = <span class="str">"10s"</span>
 <span class="key">open_command</span>  = <span class="str">"nft add element … { %IP% }"</span>
 <span class="key">close_command</span> = <span class="str">"nft delete element … { %IP% }"</span>
 <span class="key">cmd_timeout</span>   = <span class="str">"30s"</span></pre>
         </div>
       </div>
+
+      <p class="cfg-note" style="margin-top:28px;max-width:70ch;">
+        <b>Those ports are not in ascending order, and yours should not be either.</b>
+        An ordinary ascending port scan walks <code>7000, 8000, 9000</code> in exactly
+        that order and completes a door built on them inside <code>seq_timeout</code>,
+        knowing nothing about your config — in <code>reset</code> mode as much as in
+        <code>tolerant</code>. Pick ports at random and keep them out of order.
+        <a href="https://github.com/loic-rosset-ltd/knock-daemon/blob/main/SECURITY.md">What port knocking does and doesn't protect against →</a>
+      </p>
     </div>
   </section>
 
@@ -742,7 +767,7 @@
     { ip: '10.0.0.27', col: v('--c2') || '#8CA0FF', start: 0.72 },
     { ip: '10.0.0.41', col: v('--c3') || '#F0879B', start: 1.30 }
   ];
-  var PORTS = ['7000', '8000', '9000'];
+  var PORTS = ['41953', '8271', '22986'];
   var STEP_GAP = 0.62;     // seconds between a client's own knocks
   var TRAVEL   = 0.34;     // packet flight time
   var CYCLE    = 5.6;      // full loop length (s)

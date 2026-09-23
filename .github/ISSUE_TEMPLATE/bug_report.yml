@@ -6,7 +6,7 @@ body:
     attributes:
       value: |
         For anything with a security dimension, do **not** file here — see
-        [SECURITY.md](../blob/main/SECURITY.md) and use private vulnerability reporting.
+        [SECURITY.md](https://github.com/loic-rosset-ltd/knock-daemon/blob/main/SECURITY.md) and use private vulnerability reporting.
   - type: input
     id: version
     attributes:

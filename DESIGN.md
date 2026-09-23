@@ -7,19 +7,49 @@ sequences corrupting one another.
 
 ## Why not just use knockd
 
-`knockd` walks captured packets through a single, globally-shared set of
-per-door state machines. When two clients knock simultaneously, or when doors
-share ports, their progress interleaves into the same state and the matcher gets
-confused — a real client's sequence can be derailed by an unrelated packet that
-happens to land mid-sequence. It is also effectively single-threaded around
-libpcap, offers little beyond the basic match→command behaviour, and its config
-is showing its age.
+`knockd` is not the strawman it is often made into, and it is worth being exact
+about what it does — the audience for this daemon can read `knockd.c` in an
+afternoon, and several of them will.
 
-The macOS Knock client already works around the *client*-side symptom: it
-serialises knock sequences per resolved server IP so it never sends two
-interleaved sequences to one host (`KnockService.performKnockQueued`). The daemon
-fixes the *server* side properly, so correctness no longer depends on clients
-being polite.
+**It already partitions by source IP.** `knockd.c:103-113` says so verbatim
+("we keep one list of knock attempts per IP address") and the lookup at
+`knockd.c:1802` is a `strcmp` on the source address. Any claim that concurrent
+clients collide in shared global state is false, and this document used to make
+it.
+
+What `knockd` does not do is tolerate the unexpected *within* one source's lane.
+It keeps at most one in-flight attempt per source per door, and any packet that
+is not the exact next step destroys it (`knockd.c:1812-1836`; `stage = -1` at
+`:1829`) — including a re-hit of the door's own first port, because the
+new-attempt branch only runs for a source with no attempt in flight. So a TCP
+retransmit, a client that retries, or a second person behind the same NAT address
+silently ends a knock in progress and starts nothing in its place.
+
+That is the whole difference, and it is narrow. knock-daemon keeps a *set* of
+candidate attempts per source and adds to it, so those three cases resolve
+independently. `mode = "reset"` restores knockd's behaviour exactly.
+
+### What knockd has that this does not
+
+Being honest about the ledger in both directions:
+
+| | `knockd` | `knock-daemon` |
+|---|---|---|
+| Per-source partitioning | yes | yes |
+| Survives a retransmit / retry mid-sequence | no | yes |
+| Concurrent clients behind one NAT address | collide | independent |
+| `one_time_sequences` (replay protection) | **yes** | **no** — roadmap |
+| Per-door `TARGET` | **yes** | **no** |
+| `tcpflags` matching | **yes** | SYN only |
+| IPv6 command variants (`start_command_6`) | **yes** | **no** |
+| Reverse lookup, syslog integration | **yes** | no |
+| nftables set elements with kernel-side timeout | no | yes |
+| Prometheus metrics, per-source rate limiting | no | yes |
+| Multi-threaded matching | no | yes |
+
+`one_time_sequences` is the significant gap: it is replay protection this daemon
+does not have, and replay is the technique's most practical weakness. It belongs
+on the roadmap below, not in a footnote.
 
 ## Core idea: per-source isolation
 
@@ -155,7 +185,9 @@ restarts it.
    `/metrics` endpoint (`stats.rs`).
 6. ~~systemd unit + capability-based privilege (CAP_NET_RAW + CAP_NET_ADMIN)
    instead of full root.~~ **Done** — `packaging/systemd/knockd2.service`
-   (DynamicUser + AmbientCapabilities + hardening).
+   (a dedicated `knockd2` system user + AmbientCapabilities + hardening; a
+   static user rather than `DynamicUser=yes` because the config holds the door
+   sequences and must not be world-readable).
 7. ~~Release pipeline + distributable packages.~~ **Done** —
    `.github/workflows/release.yml` cross-builds `knockd2` for four Linux targets
    (`x86_64`/`aarch64`, glibc + static `musl`) via `cross`, always with
@@ -166,6 +198,17 @@ restarts it.
    a `vX.Y.Z` tag. Dual-licensed **MIT OR Apache-2.0** for broad reuse and
    downstream distro packaging. *(Follow-up: publish to crates.io once the name
    is claimed and the repo is public.)*
+8. **`one_time_sequences` — replay protection. Not built, and the largest gap
+   against `knockd`.** A knock sequence travels in the clear, so an observer on
+   the path can replay it verbatim; knockd answers this with single-use
+   sequences consumed from a file. Until this exists, the honest statement is the
+   one in `SECURITY.md`: replay is in scope for the *technique* and out of scope
+   as a bug report. Anything built here has to survive a restart and a crash
+   without either re-enabling a spent sequence or silently locking a user out,
+   which is why it is not a weekend's work.
+9. **Signed releases.** `SHA256SUMS` published beside the artifacts proves a
+   download was not truncated; it says nothing about provenance. minisign or
+   cosign, with the public key in this repository and in the release notes.
 
 ## Continuous integration
 
@@ -200,7 +243,8 @@ restarts it.
   isolation under concurrency**. Many clients (distinct `127.0.0.0/8` loopback
   source addresses, all local on Linux) knock at once with their sequences
   interleaved step-by-step, so every sequence is mid-flight simultaneously —
-  exactly the load a global-state matcher (classic knockd's weakness) gets wrong.
+  exactly the load that a matcher keeping one attempt per source gets wrong, since
+  every retry and retransmit in the mix would end a sequence rather than start one.
   The test asserts each client's door opened independently (every source landed
   in the allow-set) while one deliberately incomplete client stayed closed,
   proving state never leaks across the per-source boundary. This turns the
@@ -210,7 +254,8 @@ restarts it.
 
 Live capture needs `CAP_NET_RAW`; the nftables backend needs `CAP_NET_ADMIN`. The
 daemon runs with exactly those two capabilities and no more — the shipped systemd
-unit (`packaging/systemd/knockd2.service`) uses a `DynamicUser` plus
+unit (`packaging/systemd/knockd2.service`) uses a dedicated `knockd2` system
+user plus
 `AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN` and a hardening sandbox instead of
 running as root; the ambient grant is inherited by any `nft`/`iptables` child the
 command backend execs. The daemon observes opening packets only and never

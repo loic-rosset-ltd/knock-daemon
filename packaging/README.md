@@ -33,7 +33,9 @@ exactly two capabilities:
 | `CAP_NET_RAW`    | Open the packet-capture socket (AF_PACKET, or libpcap).         |
 | `CAP_NET_ADMIN`  | Modify the firewall (nftables backend, or a privileged command).|
 
-The unit grants those via `AmbientCapabilities` to a transient `DynamicUser`,
+The unit grants those via `AmbientCapabilities` to a dedicated `knockd2` system
+user (created by the package's `postinst`; static rather than transient because
+the config holds your door sequences and is mode 0640 `root:knockd2`),
 sets `NoNewPrivileges=yes`, and clamps everything else with a hardening block
 (`ProtectSystem=strict`, syscall filter, `RestrictAddressFamilies`, …). The
 ambient grant is inherited by the `nft`/`iptables` child the command backend may
