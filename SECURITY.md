@@ -10,6 +10,9 @@ Please include the version or commit, your config (redacted as needed), and the
 smallest reproduction you have. You will get an acknowledgement; a fix and a
 published advisory follow once one exists.
 
+If that form is unavailable to you for any reason, email
+**security@loic-rosset.net** instead. Say up front that it is a security report.
+
 ## Scope
 
 In scope — anything that lets an unauthorised source get a firewall grant, keeps

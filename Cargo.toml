@@ -10,7 +10,7 @@ homepage = "https://github.com/loic-rosset-ltd/knock-daemon"
 readme = "README.md"
 keywords = ["port-knocking", "firewall", "security", "networking", "daemon"]
 categories = ["command-line-utilities", "network-programming"]
-authors = ["Loic Rosset <web@mesclefs.com>"]
+authors = ["Loic Rosset <opensource@loic-rosset.net>"]
 
 [[bin]]
 name = "knockd2"
@@ -52,7 +52,7 @@ panic = "abort"
 
 # .deb via `cargo deb` (https://github.com/kornelski/cargo-deb).
 [package.metadata.deb]
-maintainer = "Loic Rosset <web@mesclefs.com>"
+maintainer = "Loic Rosset <opensource@loic-rosset.net>"
 copyright = "2026, Loic Rosset"
 license-file = ["LICENSE-MIT", "0"]
 section = "net"
