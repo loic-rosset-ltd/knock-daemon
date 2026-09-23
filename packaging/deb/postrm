@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+if [ "$1" = "purge" ]; then
+    if getent passwd knockd2 >/dev/null; then
+        deluser --system knockd2 >/dev/null 2>&1 || true
+    fi
+    if getent group knockd2 >/dev/null; then
+        delgroup --system knockd2 >/dev/null 2>&1 || true
+    fi
+    rm -rf /etc/knock-daemon
+fi

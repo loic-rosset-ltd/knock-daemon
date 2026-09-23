@@ -10,7 +10,9 @@
 # paths:
 #   install -Dm755 target/release/knockd2 /usr/bin/knockd2
 #   install -Dm644 packaging/systemd/knockd2.service /etc/systemd/system/knockd2.service
-#   install -Dm600 knockd.toml /etc/knock-daemon/knockd.toml
+#   groupadd --system knockd2 && useradd --system -g knockd2 \
+#     --no-create-home --shell /usr/sbin/nologin knockd2
+#   install -Dm640 -o root -g knockd2 knockd.toml /etc/knock-daemon/knockd.toml
 #   systemctl daemon-reload && systemctl enable --now knockd2
 #
 # Verify the dropped privileges once it's up:
@@ -30,10 +32,17 @@ Restart=on-failure
 RestartSec=2
 
 # --- Privilege: capabilities instead of root -------------------------------
-# Run as a transient unprivileged user, granting just the two capabilities the
-# daemon and its firewall execs need. AmbientCapabilities makes them inheritable
-# by the nft/iptables child the command backend may spawn.
-DynamicUser=yes
+# Run as a dedicated unprivileged system user, granting just the two
+# capabilities the daemon and its firewall execs need. AmbientCapabilities makes
+# them inheritable by the nft/iptables child the command backend may spawn.
+#
+# A *static* user rather than DynamicUser=yes on purpose: the config file lists
+# your door sequences, which are the knock secret, so it must NOT be world
+# readable. A transient UID cannot be granted group access to it ahead of time,
+# and ConfigurationDirectory= does not help (it does not chown the file).
+# root:knockd2 0640 lets the daemon read it and nobody else.
+User=knockd2
+Group=knockd2
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
 NoNewPrivileges=yes

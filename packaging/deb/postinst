@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+# Create the dedicated system user the unit runs as, and give it read access to
+# the config. The config lists the door sequences — the knock secret — so it is
+# root:knockd2 0640, readable by the daemon and by nobody else.
+if [ "$1" = "configure" ]; then
+    if ! getent group knockd2 >/dev/null; then
+        addgroup --system knockd2
+    fi
+    if ! getent passwd knockd2 >/dev/null; then
+        adduser --system --no-create-home --disabled-login \
+                --ingroup knockd2 --shell /usr/sbin/nologin knockd2
+    fi
+    if [ -e /etc/knock-daemon/knockd.toml ]; then
+        chown root:knockd2 /etc/knock-daemon/knockd.toml
+        chmod 0640 /etc/knock-daemon/knockd.toml
+    fi
+fi
+
+#DEBHELPER#

@@ -80,6 +80,8 @@ assets = [
 conf-files = ["/etc/knock-daemon/knockd.toml"]
 recommends = "nftables"
 
+maintainer-scripts = "packaging/deb"
+
 [package.metadata.deb.systemd-units]
 # Installs packaging/systemd/knockd2.service and wires up the standard
 # deb-systemd maintainer scripts — but does NOT enable or start it, so a fresh
@@ -102,7 +104,23 @@ assets = [
     { source = "LICENSE-APACHE", dest = "/usr/share/doc/knock-daemon/LICENSE-APACHE", mode = "644", doc = true },
 ]
 # The unit ships disabled; just refresh systemd's view of it on install/removal.
-post_install_script = "systemctl daemon-reload >/dev/null 2>&1 || true"
+pre_install_script = """\
+getent group knockd2 >/dev/null || groupadd --system knockd2
+getent passwd knockd2 >/dev/null || useradd --system -g knockd2 \
+    --no-create-home --shell /sbin/nologin knockd2
+exit 0"""
+post_install_script = """\
+if [ -e /etc/knock-daemon/knockd.toml ]; then
+    chown root:knockd2 /etc/knock-daemon/knockd.toml
+    chmod 0640 /etc/knock-daemon/knockd.toml
+fi
+systemctl daemon-reload >/dev/null 2>&1 || true
+exit 0"""
+pre_uninstall_script = """\
+if [ "$1" = 0 ]; then
+    systemctl --no-reload disable --now knockd2.service >/dev/null 2>&1 || true
+fi
+exit 0"""
 post_uninstall_script = "systemctl daemon-reload >/dev/null 2>&1 || true"
 
 [package.metadata.generate-rpm.recommends]
