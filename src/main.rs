@@ -297,8 +297,8 @@ fn schedule_close(firewall: Arc<dyn firewall::Firewall + Sync>, door: &ResolvedD
     });
 }
 
-/// Replay a canned, interleaved scenario so the concurrency story is visible
-/// without root or libpcap.
+/// Replay a canned scenario so the matcher's tolerance of duplicate and
+/// interleaved packets is visible without root or libpcap.
 fn run_demo() -> Result<()> {
     fn ip(n: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, n))
@@ -337,21 +337,25 @@ fn run_demo() -> Result<()> {
         },
     }];
 
-    // Two clients (.10 and .20) knock the SAME door at the SAME time, fully
-    // interleaved — the exact case classic knockd mishandles.
+    // .10's opening packet is delivered twice — a retry or a TCP retransmit.
+    // Classic knockd destroys the in-flight attempt on that duplicate and starts
+    // nothing in its place (`stage = -1`), so .10 never opens. Here the duplicate
+    // simply opens a second candidate beside the first. .20 knocks interleaved
+    // throughout, which both daemons handle.
     let events = vec![
         tcp(ip(10), 7000, 0),
         tcp(ip(20), 7000, 5),
+        tcp(ip(10), 7000, 9), // <-- the duplicate that ends a knockd sequence
         tcp(ip(20), 8000, 12),
         tcp(ip(10), 8000, 18),
-        tcp(ip(20), 9000, 25), // .20 completes first
-        tcp(ip(10), 9000, 31), // .10 completes too
+        tcp(ip(20), 9000, 25), // .20 completes
+        tcp(ip(10), 9000, 31), // .10 completes despite the duplicate
     ];
 
     let mut engine = Engine::new(doors, firewall::FirewallKind::Command, MatchMode::Tolerant)?;
     let mut cap = ReplayCapture::new(events);
-    println!("--- knock-daemon demo: two interleaved clients knocking the same door ---");
+    println!("--- knock-daemon demo: a duplicated opening packet, and two interleaved clients ---");
     cap.run(&mut |ev| engine.on_packet(ev))?;
-    println!("--- both clients accepted independently; no cross-talk ---");
+    println!("--- both accepted; the duplicate did not end .10's sequence ---");
     Ok(())
 }

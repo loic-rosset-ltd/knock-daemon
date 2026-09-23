@@ -1,13 +1,19 @@
 # knock-daemon
 
-A concurrent port-knocking daemon for Linux — a [`knockd`](https://www.zeroflux.org/projects/knock)
-replacement that handles **many simultaneous knock sequences without cross-talk**.
+A concurrent port-knocking daemon for Linux — a [`knockd`](https://github.com/jvinet/knock)
+replacement that keeps a knock alive when the unexpected happens.
 
-Classic `knockd` shares one global set of door state machines across all traffic,
-so concurrent or interleaved sequences from different clients can corrupt each
-other. knock-daemon partitions in-flight matching state **per source IP**, so any
-number of clients can knock at once — even the same door, fully interleaved — and
-each succeeds independently.
+Classic `knockd` already separates knock state per source IP. What it does not do
+is tolerate anything unexpected *inside* a source's lane: it tracks at most one
+in-flight attempt per source per door, and any packet that isn't the exact next
+step destroys it — including a re-hit of the door's own first port. A TCP
+retransmit, a client that retries, or a second person behind the same NAT address
+silently kills a knock in progress, and nothing starts in its place.
+
+knock-daemon keeps a *set* of candidate attempts per source and adds to it: every
+hit on a door's first port opens a new candidate alongside the ones already
+running. Retries, retransmits and shared source addresses stop being failure
+modes. Set `mode = "reset"` if you want knockd's abort-on-stray behaviour back.
 
 Part of the [Knock](https://github.com/loic-rosset-ltd) family: the
 [macOS client](https://github.com/loic-rosset-ltd/knock-macos) is the knocking

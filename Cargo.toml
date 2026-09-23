@@ -3,7 +3,7 @@ name = "knock-daemon"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
-description = "Concurrent port-knocking daemon — a knockd replacement that handles many simultaneous knock sequences without cross-talk."
+description = "Port-knocking daemon for Linux — a knockd replacement that survives retries, retransmits and clients behind one NAT address."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/loic-rosset-ltd/knock-daemon"
 homepage = "https://github.com/loic-rosset-ltd/knock-daemon"
@@ -58,10 +58,12 @@ license-file = ["LICENSE-MIT", "0"]
 section = "net"
 priority = "optional"
 extended-description = """\
-A concurrent port-knocking daemon for Linux — a knockd replacement that handles \
-many simultaneous knock sequences without cross-talk. In-flight matching state \
-is partitioned per source IP, so any number of clients can knock at once (even \
-the same door, fully interleaved) and each succeeds independently. Ships an \
+A port-knocking daemon for Linux — a knockd replacement that keeps a knock \
+alive when the unexpected happens. knockd tracks one in-flight attempt per \
+source per door and destroys it on any packet that isn't the exact next step, \
+including a re-hit of the door's own first port; knock-daemon tracks a set of \
+candidate attempts per source and adds to it, so retries, TCP retransmits and \
+clients sharing one NAT address each resolve independently. Ships an \
 nftables firewall backend, a knockd-compatible command backend, a pure-Rust \
 AF_PACKET capture path, and a hardened systemd unit that runs with just \
 CAP_NET_RAW + CAP_NET_ADMIN instead of root."""
@@ -89,7 +91,7 @@ start = false
 
 # .rpm via `cargo generate-rpm` (https://github.com/cat-in-136/cargo-generate-rpm).
 [package.metadata.generate-rpm]
-summary = "Concurrent port-knocking daemon — a knockd replacement without cross-talk."
+summary = "Port-knocking daemon for Linux — a knockd replacement that survives retries and shared source addresses."
 assets = [
     { source = "target/release/knockd2", dest = "/usr/bin/knockd2", mode = "755" },
     { source = "knockd.toml", dest = "/etc/knock-daemon/knockd.toml", mode = "640", config = true },

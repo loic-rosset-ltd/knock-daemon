@@ -1,6 +1,6 @@
 # knock-daemon — design
 
-A port-knocking daemon for Linux that replaces classic [`knockd`](https://www.zeroflux.org/projects/knock).
+A port-knocking daemon for Linux that replaces classic [`knockd`](https://github.com/jvinet/knock).
 Its reason to exist is **correct concurrent sequence matching**: many clients
 knocking at the same time — including the same door, fully interleaved — without
 sequences corrupting one another.

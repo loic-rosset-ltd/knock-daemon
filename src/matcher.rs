@@ -1,12 +1,15 @@
 //! Concurrent sequence matcher — the core of knock-daemon and its main point of
 //! difference from classic `knockd`.
 //!
-//! `knockd` walks packets through a single global set of door state machines and
-//! gets confused when several clients knock at once, or when doors share ports.
-//! Here, in-flight progress is partitioned **per source IP**, and within an IP we
-//! track an independent attempt for every door. Because each source is isolated,
-//! simultaneous sequences from different clients never interfere, and overlapping
-//! doors (sharing a prefix) both advance from the same packet.
+//! `knockd` also partitions by source IP, but keeps at most one in-flight
+//! attempt per source per door and destroys it on any packet that isn't the
+//! exact next step — including a re-hit of the door's own first port, so a retry
+//! or a TCP retransmit silently kills the sequence and starts nothing in its
+//! place. Here we track a *set* of live attempts per source and add to it: every
+//! hit on a door's first step opens a new candidate beside the running ones, so
+//! retries, retransmits and clients sharing one source address (NAT, CGNAT, a
+//! jump host) all resolve independently. Overlapping doors sharing a prefix both
+//! advance from the same packet.
 //!
 //! The matcher is deliberately pure: it takes a logical millisecond timestamp on
 //! each event rather than reading the clock, so its behaviour is fully
