@@ -6,8 +6,10 @@
 # See the concurrency story without any setup:
 #   knockd2 --demo
 
-# Interface to capture on. Omit for the capture layer's default device.
-interface = "eth0"
+# Interface to capture on. Omit (as shipped) for the capture layer's default
+# device. `eth0` does not exist on any distro with predictable interface names,
+# which is all current ones — find yours with:  ip -br link
+# interface = "enp3s0"
 
 [firewall]
 # "command" — run open_command/close_command with %IP% substituted (knockd-style).
@@ -43,9 +45,14 @@ shards = 1
 
 # A door: an ordered port sequence that, completed in time, opens access.
 # Steps are "<port>/<tcp|udp>"; a bare number defaults to tcp.
+#
+# Do not use a sequence in ascending port order. An ordinary ascending port
+# scan walks 7000, 8000, 9000 in exactly that order and completes such a door
+# inside seq_timeout without knowing anything — in "reset" mode too. Pick ports
+# that do not ascend, as below, and pick them at random rather than by pattern.
 [[door]]
 name = "ssh"
-sequence = ["7000/tcp", "8000/udp", "9000/tcp"]
+sequence = ["41953/tcp", "8271/udp", "22986/tcp"]
 seq_timeout = "10s"                # whole sequence must complete within this window
 open_command = "nft add element inet filter knock_clients { %IP% }"
 close_command = "nft delete element inet filter knock_clients { %IP% }"
@@ -55,7 +62,7 @@ cmd_timeout = "30s"                # auto-run close_command this long after open
 # the daemon tracks each source IP independently.
 [[door]]
 name = "https-admin"
-sequence = ["7000/tcp", "8500/tcp", "9100/tcp"]
+sequence = ["41953/tcp", "5387/tcp", "17604/tcp"]
 seq_timeout = "10s"
 open_command = "nft add element inet filter admin_clients { %IP% }"
 
@@ -67,7 +74,7 @@ open_command = "nft add element inet filter admin_clients { %IP% }"
 #
 # [[door]]
 # name = "ssh"
-# sequence = ["7000/tcp", "8000/udp", "9000/tcp"]
+# sequence = ["41953/tcp", "8271/udp", "22986/tcp"]
 # seq_timeout = "10s"
 # nft_set = "inet filter knock_clients"   # "<family> <table> <set>"; family defaults to inet
 # cmd_timeout = "30s"                       # kernel-side element timeout

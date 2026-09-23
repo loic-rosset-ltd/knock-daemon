@@ -552,6 +552,128 @@ mod tests {
         assert_eq!(m.tracked_sources(), 0);
     }
 
+    /// An **ascending** door sequence is completed by an ordinary ascending
+    /// port scan, in both match modes. This is a property of port knocking, not
+    /// a bug in this matcher — but it is the reason no example sequence in this
+    /// repository is monotonic, and the reason `SECURITY.md` says so out loud.
+    /// Kept as a test so that a future edit which "tidies" an example back into
+    /// ascending order fails here instead of in someone's threat model.
+    fn ascending_sweep(mode: MatchMode, ports: &[u16]) -> bool {
+        let mut m = Matcher::with_mode(vec![door("ssh", ports, 10_000)], mode);
+        // One source sweeping *every* port in ascending order, a millisecond
+        // apart. The full range matters: it means a sequence survives because
+        // its ports are out of ascending order, not because the scan stopped
+        // short of them. Any three ports are all reached here.
+        (1u16..=u16::MAX).any(|port| !m.process(ev(ip(1), port, u64::from(port))).is_empty())
+    }
+
+    #[test]
+    fn ascending_sequence_falls_to_a_port_scan() {
+        assert!(
+            ascending_sweep(MatchMode::Tolerant, &[7000, 8000, 9000]),
+            "ascending sequence should be completed by an ascending sweep (tolerant)"
+        );
+        assert!(
+            ascending_sweep(MatchMode::Reset, &[7000, 8000, 9000]),
+            "ascending sequence should be completed by an ascending sweep (reset) \
+             — `reset` is not the safer mode here"
+        );
+    }
+
+    /// The loopback case from the install rehearsal (finding F-05): on `lo`,
+    /// every frame is observed twice — once outbound, once looped back — so the
+    /// matcher sees the whole sequence doubled.
+    ///
+    /// Two different outcomes, both verified against a live daemon on `lo`:
+    ///
+    /// * **Tolerant** opens the door exactly **once**. A duplicate is just
+    ///   another candidate, and the door is reported once per packet with its
+    ///   siblings dropped, so a non-idempotent `open_command` runs once.
+    /// * **Reset** opens it **zero** times. A second copy of a step is
+    ///   indistinguishable from a stray hit to a monitored port, which is
+    ///   precisely what `reset` is defined to abort on. This is not a matcher
+    ///   bug — it is why the AF_PACKET backend sets `PACKET_IGNORE_OUTGOING`,
+    ///   without which a migrated `knockd.conf` (which defaults to `reset`)
+    ///   never opens a door on an interface that sees its own traffic.
+    #[test]
+    fn a_doubled_sequence_opens_once_in_tolerant_and_never_in_reset() {
+        let ports = [41953u16, 8271, 22986];
+        let opens = |mode| {
+            let mut m = Matcher::with_mode(vec![door("ssh", &ports, 10_000)], mode);
+            let mut n = 0;
+            for (i, &port) in ports.iter().enumerate() {
+                let t = (i as u64) * 10;
+                n += m.process(ev(ip(1), port, t)).len();
+                n += m.process(ev(ip(1), port, t + 2)).len();
+            }
+            n
+        };
+        assert_eq!(
+            opens(MatchMode::Tolerant),
+            1,
+            "a doubled sequence must open the door once, not twice"
+        );
+        assert_eq!(
+            opens(MatchMode::Reset),
+            0,
+            "reset aborts on the duplicate — the capture layer must not deliver it"
+        );
+    }
+
+    /// `reset` is not the safer mode. Both modes open a fresh candidate whenever
+    /// a door's first port is hit, so an attacker who knows *which* three ports a
+    /// door uses — but not their order — completes it with one short burst that
+    /// covers every ordering. The README says this; this test is why it may.
+    ///
+    /// The burst is the 9-symbol superpermutation of three symbols,
+    /// `1 2 3 1 2 1 3 2 1`, which contains all six permutations as substrings.
+    #[test]
+    fn known_port_set_falls_to_one_burst_in_both_modes() {
+        const SUPERPERM: [usize; 9] = [0, 1, 2, 0, 1, 0, 2, 1, 0];
+        let ports = [41953u16, 8271, 22986];
+
+        // All six orderings of the same three ports.
+        let orderings = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+
+        for mode in [MatchMode::Tolerant, MatchMode::Reset] {
+            for order in orderings {
+                let secret: Vec<u16> = order.iter().map(|&i| ports[i]).collect();
+                let mut m = Matcher::with_mode(vec![door("ssh", &secret, 10_000)], mode);
+                let opened = SUPERPERM
+                    .iter()
+                    .enumerate()
+                    .any(|(t, &i)| !m.process(ev(ip(1), ports[i], t as u64)).is_empty());
+                assert!(
+                    opened,
+                    "9-packet burst should open {secret:?} in {mode:?} — knowing the \
+                     port set, not the order, is enough in either mode"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_monotonic_sequence_survives_a_port_scan() {
+        // The shape every example in this repo now uses. All three ports are
+        // hit by the sweep above — 8271, then 22986, then 41953 — but the
+        // door's *first* step is the highest, so it is reached only after the
+        // steps that would have followed it. A monotonic scan cannot walk a
+        // non-monotonic sequence in order, whatever its range.
+        for mode in [MatchMode::Tolerant, MatchMode::Reset] {
+            assert!(
+                !ascending_sweep(mode, &[41953, 8271, 22986]),
+                "non-monotonic sequence must not be completed by an ascending sweep ({mode:?})"
+            );
+        }
+    }
+
     #[test]
     fn tolerant_mode_survives_out_of_order_monitored_hit() {
         // The same sequence the Reset test rejects succeeds under the default

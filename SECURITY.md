@@ -30,9 +30,13 @@ exhausts its memory, or escalates beyond its two capabilities:
 
 ## Out of scope: what port knocking is not
 
-Port knocking is **obfuscation, not authentication**, and this daemon does not
-pretend otherwise. The following are properties of the technique, documented
-deliberately, and are not vulnerabilities in this implementation:
+Port knocking is **obfuscation, not authentication**. What it buys you is that
+your SSH port stops showing up in scans and your auth log stops filling with
+credential stuffing. That is worth something. It is not a lock, and nothing in
+this daemon makes it one.
+
+The following are properties of the technique, documented deliberately, and are
+not vulnerabilities in this implementation:
 
 - **A knock sequence travels in the clear and is replayable.** Anyone on the path
   — a router, an ISP, a hypervisor, a compromised switch — can observe a sequence
@@ -40,15 +44,34 @@ deliberately, and are not vulnerabilities in this implementation:
   authentication (SSH keys, mTLS, a VPN) behind the door.
 - **A grant is scoped to a source IP**, so anything sharing that address (NAT,
   a corporate egress) shares the grant for its lifetime.
-- **Sequences can be brute-forced** given enough traffic and time. The per-source
-  rate limiter (`[matching] rate_limit`) raises the cost; it does not remove it.
+- **A sequence in ascending port order is completed by an ordinary ascending
+  port scan**, inside `seq_timeout`, by a scanner that knows nothing about your
+  config. Not "enough traffic and time" — one `nmap` run. This is why no example
+  sequence in this repository is monotonic. Do not use one.
+  (`ascending_sequence_falls_to_a_port_scan` in `src/matcher.rs` is this fact,
+  executable.)
+- **Knowing a door's port set is nearly as good as knowing its sequence.** Three
+  known ports have six orderings, and nine packets cover all six — in `reset`
+  mode as much as in `tolerant`, because both start a fresh attempt on a hit to
+  the door's first port. `reset` is not the safer mode; choosing ports nobody can
+  guess is what does the work.
+  (`known_port_set_falls_to_one_burst_in_both_modes`, same file.)
+- **Sequences can otherwise be brute-forced** given enough traffic and time. The
+  per-source rate limiter (`[matching] rate_limit`) raises the cost; it does not
+  remove it.
+
+- **A door does nothing on its own.** knock-daemon only ever *adds* a source to
+  an allow-set. Without a default-deny firewall rule in front of the service, the
+  port was already open and the knock changed nothing. See the Configuration
+  section of [README.md](README.md) for the ruleset that makes a door mean
+  something.
 
 Reports amounting to "the sequence can be sniffed" will be closed with a pointer
 to this section.
 
 ## Running it safely
 
-Use the shipped systemd unit (`packaging/systemd/knockd2.service`): a
-`DynamicUser` with exactly `CAP_NET_RAW` and `CAP_NET_ADMIN` ambient, plus the
-hardening sandbox. Do not run the daemon as root. Bind `[stats] listen` to
+Use the shipped systemd unit (`packaging/systemd/knockd2.service`): a dedicated
+`knockd2` system user with exactly `CAP_NET_RAW` and `CAP_NET_ADMIN` ambient,
+plus the hardening sandbox. Do not run the daemon as root. Bind `[stats] listen` to
 localhost or a trusted management interface — it exposes operational counters.
