@@ -315,17 +315,20 @@ fn run_demo() -> Result<()> {
     let doors = vec![ResolvedDoor {
         spec: matcher::DoorSpec {
             name: "ssh".into(),
+            // Not in ascending order, like every other example in this
+            // repository: an ascending sequence is completed by an ordinary
+            // ascending port scan. See SECURITY.md.
             sequence: vec![
                 matcher::PortSpec {
-                    port: 7000,
+                    port: 41953,
                     proto: Proto::Tcp,
                 },
                 matcher::PortSpec {
-                    port: 8000,
+                    port: 8271,
                     proto: Proto::Tcp,
                 },
                 matcher::PortSpec {
-                    port: 9000,
+                    port: 22986,
                     proto: Proto::Tcp,
                 },
             ],
@@ -343,19 +346,58 @@ fn run_demo() -> Result<()> {
     // simply opens a second candidate beside the first. .20 knocks interleaved
     // throughout, which both daemons handle.
     let events = vec![
-        tcp(ip(10), 7000, 0),
-        tcp(ip(20), 7000, 5),
-        tcp(ip(10), 7000, 9), // <-- the duplicate that ends a knockd sequence
-        tcp(ip(20), 8000, 12),
-        tcp(ip(10), 8000, 18),
-        tcp(ip(20), 9000, 25), // .20 completes
-        tcp(ip(10), 9000, 31), // .10 completes despite the duplicate
+        tcp(ip(10), 41953, 0),
+        tcp(ip(20), 41953, 5),
+        tcp(ip(10), 41953, 9), // <-- the duplicate that ends a knockd sequence
+        tcp(ip(20), 8271, 12),
+        tcp(ip(10), 8271, 18),
+        tcp(ip(20), 22986, 25), // .20 completes
+        tcp(ip(10), 22986, 31), // .10 completes despite the duplicate
     ];
+
+    // The sequence, for annotating each replayed packet with the step it is.
+    let seq: Vec<u16> = doors[0].spec.sequence.iter().map(|p| p.port).collect();
+    let n_steps = seq.len();
 
     let mut engine = Engine::new(doors, firewall::FirewallKind::Command, MatchMode::Tolerant)?;
     let mut cap = ReplayCapture::new(events);
+
     println!("--- knock-daemon demo: a duplicated opening packet, and two interleaved clients ---");
-    cap.run(&mut |ev| engine.on_packet(ev))?;
-    println!("--- both accepted; the duplicate did not end .10's sequence ---");
+    println!(
+        "door \"ssh\" = {} (seq_timeout 10s, mode = tolerant)\n",
+        seq.iter()
+            .map(|p| format!(":{p}"))
+            .collect::<Vec<_>>()
+            .join(" → ")
+    );
+    println!("  replayed packets, in the order the capture layer sees them:");
+
+    // Show the stream, not just its outcome. A skeptic's objection to the old
+    // output was fair: two "accepted" lines prove a door can open, they do not
+    // show that the packets were interleaved or that one arrived twice.
+    let mut seen_first: Vec<IpAddr> = Vec::new();
+    cap.run(&mut |ev| {
+        let step = seq.iter().position(|&p| p == ev.port);
+        let dup = step == Some(0) && seen_first.contains(&ev.src);
+        if step == Some(0) {
+            seen_first.push(ev.src);
+        }
+        println!(
+            "  t={:>3}ms  {:<14} → :{:<6} {}{}",
+            ev.at_ms,
+            ev.src.to_string(),
+            ev.port,
+            step.map(|i| format!("[ssh {}/{}]", i + 1, n_steps))
+                .unwrap_or_default(),
+            if dup { "   <-- duplicate" } else { "" },
+        );
+        engine.on_packet(ev)
+    })?;
+
+    println!(
+        "\n--- both sources completed the door. Note .10's opening packet arrived twice (t=0ms,\n\
+         \x20   t=9ms): classic knockd discards the in-flight attempt on that duplicate and starts\n\
+         \x20   nothing in its place, so .10 would never have opened. ---"
+    );
     Ok(())
 }
