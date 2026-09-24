@@ -11,6 +11,7 @@ mod firewall;
 mod knockd;
 mod matcher;
 mod ratelimit;
+mod spa;
 mod stats;
 
 use std::net::{IpAddr, Ipv4Addr};
