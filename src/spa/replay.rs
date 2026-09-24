@@ -187,7 +187,10 @@ mod tests {
     fn memory_is_bounded_by_the_window_not_by_uptime() {
         let mut g = ReplayGuard::new(10, 1_000_000);
         for t in 0..10_000u64 {
-            assert_eq!(g.check(id((t % 251) as u8), 1_000 + t, 1_000 + t), ReplayVerdict::Fresh);
+            assert_eq!(
+                g.check(id((t % 251) as u8), 1_000 + t, 1_000 + t),
+                ReplayVerdict::Fresh
+            );
         }
         // 10 000 accepted packets, but only a window's worth is retained.
         assert!(

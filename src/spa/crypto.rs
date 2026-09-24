@@ -18,7 +18,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use zeroize::Zeroizing;
 
-use super::packet::{Mode, EPH_PUB_LEN, NONCE_LEN};
+use super::packet::{EPH_PUB_LEN, NONCE_LEN};
 use super::SpaError;
 
 /// A symmetric AEAD key. Wrapped so it is wiped when dropped.
@@ -74,7 +74,13 @@ pub fn seal(
 ) -> Result<Vec<u8>, SpaError> {
     let cipher = XChaCha20Poly1305::new(key.as_ref().into());
     cipher
-        .encrypt(XNonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|_| SpaError::Seal)
 }
 
@@ -124,16 +130,6 @@ pub fn verify_signature(
         .map_err(|_| SpaError::BadSignature)
 }
 
-/// Which mode a given key material implies. Small helper so callers do not
-/// re-derive the mapping and get it inconsistent.
-pub fn mode_for_static_key(has_static: bool) -> Mode {
-    if has_static {
-        Mode::PublicKey
-    } else {
-        Mode::Psk
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,7 +157,10 @@ mod tests {
     fn a_wrong_key_fails_to_open() {
         let n = [2u8; NONCE_LEN];
         let sealed = seal(&key(1), &n, b"h", b"x").unwrap();
-        assert!(matches!(open(&key(2), &n, b"h", &sealed), Err(SpaError::Open)));
+        assert!(matches!(
+            open(&key(2), &n, b"h", &sealed),
+            Err(SpaError::Open)
+        ));
     }
 
     /// The AAD carries the header and the ephemeral key. If a changed AAD still
@@ -229,8 +228,7 @@ mod tests {
         let eph_sk = StaticSecret::from([9u8; 32]);
         let eph_pk = PublicKey::from(&eph_sk);
 
-        let server_shared =
-            x25519_shared(server_sk.as_bytes(), eph_pk.as_bytes()).unwrap();
+        let server_shared = x25519_shared(server_sk.as_bytes(), eph_pk.as_bytes()).unwrap();
         let client_shared = eph_sk.diffie_hellman(&server_pk);
         assert_eq!(&server_shared, client_shared.as_bytes());
 

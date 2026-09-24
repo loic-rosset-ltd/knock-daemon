@@ -21,8 +21,102 @@ pub struct Config {
     pub matching: MatchingConfig,
     #[serde(default)]
     pub stats: StatsConfig,
+    #[serde(default)]
+    pub spa: SpaConfig,
     #[serde(rename = "door", default)]
     pub doors: Vec<DoorConfig>,
+}
+
+/// Single Packet Authorization. Off by default: it is strictly additional to
+/// sequence knocking, and a daemon that was not asked for it should not start
+/// deriving keys or watching a new port.
+///
+/// A door is still a door — an SPA packet names one by name, and the door's
+/// config decides what opens. The client never names a port, which is why there
+/// is no equivalent of fwknop's `OPEN_PORTS`/`RESTRICT_PORTS` here: a request
+/// for an arbitrary port is not something the format can express.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// UDP port SPA packets are *observed* on. Nothing is bound: the capture
+    /// layer watches for it, so the host still has no listening socket.
+    #[serde(default = "default_spa_port")]
+    pub port: u16,
+    /// PSK mode: file holding the shared passphrase, and a salt that must be the
+    /// same on both sides. Argon2id runs once at startup, never per packet.
+    pub passphrase_file: Option<String>,
+    pub salt: Option<String>,
+    /// Public-key mode: this server's X25519 static secret, and the
+    /// `authorized_keys` file of client Ed25519 identities.
+    pub static_key_file: Option<String>,
+    pub authorized_keys: Option<String>,
+    /// How far either side of our clock a packet timestamp may sit. Also bounds
+    /// replay memory, since nothing outside the window can be replayed anyway.
+    #[serde(default = "default_spa_window")]
+    pub window: String,
+    #[serde(default = "default_spa_duration")]
+    pub default_duration: String,
+    /// Hard ceiling on what a packet may request, so a client cannot grant
+    /// itself unbounded access. fwknop's `MAX_FW_TIMEOUT`.
+    #[serde(default = "default_spa_max_duration")]
+    pub max_duration: String,
+    /// Allow a payload to name an address other than the one observed. Off by
+    /// default: it widens what a stolen packet can do.
+    #[serde(default)]
+    pub allow_explicit_addr: bool,
+    #[serde(default = "default_spa_replay_entries")]
+    pub max_replay_entries: usize,
+}
+
+impl Default for SpaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_spa_port(),
+            passphrase_file: None,
+            salt: None,
+            static_key_file: None,
+            authorized_keys: None,
+            window: default_spa_window(),
+            default_duration: default_spa_duration(),
+            max_duration: default_spa_max_duration(),
+            allow_explicit_addr: false,
+            max_replay_entries: default_spa_replay_entries(),
+        }
+    }
+}
+
+fn default_spa_port() -> u16 {
+    62201
+}
+fn default_spa_window() -> String {
+    "30s".to_string()
+}
+fn default_spa_duration() -> String {
+    "30s".to_string()
+}
+fn default_spa_max_duration() -> String {
+    "1h".to_string()
+}
+fn default_spa_replay_entries() -> usize {
+    65_536
+}
+
+/// Validated SPA settings, with durations already in seconds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSpa {
+    pub port: u16,
+    pub window_secs: u64,
+    pub default_duration_secs: u32,
+    pub max_duration_secs: u32,
+    pub allow_explicit_addr: bool,
+    pub max_replay_entries: usize,
+    pub passphrase_file: Option<String>,
+    pub salt: Option<String>,
+    pub static_key_file: Option<String>,
+    pub authorized_keys: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -185,6 +279,82 @@ impl Config {
 
     /// Validate and lower the parsed config into runtime doors, checking that
     /// each door carries the fields the active firewall backend needs.
+    /// Validate the `[spa]` table. `Ok(None)` means SPA is switched off, which
+    /// is a normal state, not a failure.
+    ///
+    /// Everything is checked here rather than at first packet, so `--check`
+    /// catches a broken SPA setup before the service does. A daemon that starts
+    /// and then silently refuses every knock is the worst of both worlds.
+    pub fn resolve_spa(&self) -> Result<Option<ResolvedSpa>> {
+        let c = &self.spa;
+        if !c.enabled {
+            return Ok(None);
+        }
+        if c.port == 0 {
+            bail!("[spa] port must not be 0");
+        }
+
+        let has_psk = c.passphrase_file.is_some();
+        let has_pubkey = c.static_key_file.is_some();
+        if !has_psk && !has_pubkey {
+            bail!(
+                "[spa] is enabled but no key material is configured; set \
+                 passphrase_file (+ salt) for PSK mode, or static_key_file \
+                 (+ authorized_keys) for public-key mode"
+            );
+        }
+        // A passphrase without a salt is a silent interoperability failure: the
+        // daemon derives one key, every client derives another, and nothing ever
+        // opens. Refuse it at load instead.
+        if has_psk && c.salt.is_none() {
+            bail!(
+                "[spa] passphrase_file is set but salt is not; both sides must use the same salt"
+            );
+        }
+        if let Some(salt) = &c.salt {
+            if salt.len() < 8 {
+                bail!(
+                    "[spa] salt must be at least 8 characters (got {})",
+                    salt.len()
+                );
+            }
+        }
+        // Public-key mode without an authorized_keys file authorises nobody. That
+        // is safe, but it is almost certainly a mistake, so say so loudly rather
+        // than running a daemon that can never accept a packet.
+        if has_pubkey && c.authorized_keys.is_none() {
+            bail!("[spa] static_key_file is set but authorized_keys is not; no client could be authorised");
+        }
+
+        let window_secs = parse_duration_ms(&c.window).context("[spa] window")? / 1000;
+        if window_secs == 0 {
+            bail!("[spa] window must be at least 1s");
+        }
+        let default_duration_secs = duration_secs(&c.default_duration, "[spa] default_duration")?;
+        let max_duration_secs = duration_secs(&c.max_duration, "[spa] max_duration")?;
+        if default_duration_secs > max_duration_secs {
+            bail!(
+                "[spa] default_duration ({default_duration_secs}s) exceeds max_duration ({max_duration_secs}s)"
+            );
+        }
+        if c.max_replay_entries == 0 {
+            bail!("[spa] max_replay_entries must be greater than 0");
+        }
+
+        Ok(Some(ResolvedSpa {
+            port: c.port,
+            window_secs,
+            default_duration_secs,
+            max_duration_secs,
+            allow_explicit_addr: c.allow_explicit_addr,
+            max_replay_entries: c.max_replay_entries,
+            passphrase_file: c.passphrase_file.clone(),
+            salt: c.salt.clone(),
+            static_key_file: c.static_key_file.clone(),
+            authorized_keys: c.authorized_keys.clone(),
+        }))
+    }
+
     pub fn resolve(&self, kind: FirewallKind) -> Result<Vec<ResolvedDoor>> {
         if self.doors.is_empty() {
             bail!("config defines no [[door]] sections");
@@ -300,6 +470,8 @@ fn parse_duration_ms(s: &str) -> Result<u64> {
         (n, 1_000)
     } else if let Some(n) = s.strip_suffix('m') {
         (n, 60_000)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3_600_000)
     } else {
         (s, 1_000)
     };
@@ -308,6 +480,17 @@ fn parse_duration_ms(s: &str) -> Result<u64> {
         .parse()
         .with_context(|| format!("invalid duration {s:?}"))?;
     Ok(value * mult)
+}
+
+/// Parse a duration into whole seconds, rejecting zero and anything that would
+/// not fit the `u32` the SPA payload carries.
+fn duration_secs(text: &str, what: &str) -> Result<u32> {
+    let ms = parse_duration_ms(text).with_context(|| what.to_string())?;
+    let secs = ms / 1000;
+    if secs == 0 {
+        bail!("{what} must be at least 1s");
+    }
+    u32::try_from(secs).map_err(|_| anyhow::anyhow!("{what} is too large ({secs}s)"))
 }
 
 #[cfg(test)]
@@ -478,5 +661,50 @@ mod tests {
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert!(cfg.resolve(FirewallKind::Nftables).is_err());
+    }
+
+    /// Hours exist because `[spa] max_duration` defaults to "1h". The first
+    /// version of that default did not parse, and every happy-path test set an
+    /// explicit duration, so nothing caught it until a deliberately-invalid
+    /// config was tried. Pin the whole grammar, not just the case that broke.
+    #[test]
+    fn duration_grammar_covers_every_suffix() {
+        for (text, want_ms) in [
+            ("250ms", 250u64),
+            ("30s", 30_000),
+            ("5m", 300_000),
+            ("1h", 3_600_000),
+            ("2h", 7_200_000),
+            ("45", 45_000), // bare = seconds
+        ] {
+            assert_eq!(parse_duration_ms(text).unwrap(), want_ms, "parsing {text}");
+        }
+        assert!(parse_duration_ms("abc").is_err());
+        assert!(parse_duration_ms("1d").is_err());
+    }
+
+    /// Every default in `[spa]` must actually parse. A default that does not is
+    /// a landmine for anyone who omits the field.
+    #[test]
+    fn every_spa_default_parses() {
+        let c = SpaConfig::default();
+        assert!(
+            parse_duration_ms(&c.window).is_ok(),
+            "window {:?}",
+            c.window
+        );
+        assert!(parse_duration_ms(&c.default_duration).is_ok());
+        assert!(parse_duration_ms(&c.max_duration).is_ok());
+
+        // And the whole table resolves once key material is supplied.
+        let cfg: Config = toml::from_str(
+            "[[door]]\nname = \"ssh\"\nsequence = [\"1/tcp\"]\nopen_command = \"x\"\n\n\
+             [spa]\nenabled = true\nstatic_key_file = \"k\"\nauthorized_keys = \"a\"\n",
+        )
+        .unwrap();
+        let sp = cfg.resolve_spa().unwrap().expect("spa enabled");
+        assert_eq!(sp.max_duration_secs, 3600);
+        assert_eq!(sp.default_duration_secs, 30);
+        assert_eq!(sp.window_secs, 30);
     }
 }

@@ -8,6 +8,8 @@
 mod capture;
 mod config;
 mod firewall;
+#[cfg(feature = "compat-fwknop")]
+mod fwknop;
 mod knockd;
 mod matcher;
 mod ratelimit;
@@ -15,7 +17,7 @@ mod spa;
 mod stats;
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -24,7 +26,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use capture::{Capture, ReplayCapture};
+use capture::{Capture, Captured, ReplayCapture};
 use config::{Config, ResolvedDoor};
 use matcher::{MatchMode, Matcher, PacketEvent, Proto, ShardedMatcher};
 
@@ -82,6 +84,7 @@ fn main() -> Result<()> {
     let rate = cfg.rate_limit()?;
     let shards = cfg.shard_count();
     let doors = cfg.resolve(fw_kind).context("validating config")?;
+    let spa_cfg = cfg.resolve_spa().context("validating [spa]")?;
 
     if cli.check {
         let iface = cfg.interface.as_deref().unwrap_or("<capture default>");
@@ -96,6 +99,34 @@ fn main() -> Result<()> {
             cfg.matching.rate_limit.as_deref().unwrap_or("none"),
             cfg.stats_listen().unwrap_or("disabled"),
         );
+        match &spa_cfg {
+            None => println!("  spa = disabled"),
+            Some(sp) => {
+                // Name the mode explicitly: "enabled" alone has caught people out
+                // who set a passphrase and expected public-key mode.
+                let mode = match (&sp.passphrase_file, &sp.static_key_file) {
+                    (Some(_), Some(_)) => "psk + public-key",
+                    (Some(_), None) => "psk",
+                    (None, Some(_)) => "public-key",
+                    (None, None) => unreachable!("resolve_spa rejects a keyless [spa]"),
+                };
+                println!(
+                    "  spa = enabled on udp/{} ({mode}), window {}s, duration {}s (max {}s)",
+                    sp.port, sp.window_secs, sp.default_duration_secs, sp.max_duration_secs
+                );
+                // Loading proves the files parse, which is the whole point of
+                // --check: a broken key file should fail here, not at 3am on the
+                // first knock.
+                let v = build_spa_verifier(sp).context("loading SPA key material")?;
+                if let Some(pk) = v.static_public() {
+                    println!(
+                        "  spa static public key: {} {}",
+                        spa::keys::TAG_SRV_PUB,
+                        spa::keys::encode_hex32(&pk)
+                    );
+                }
+            }
+        }
         for d in &doors {
             println!(
                 "  - {} ({} steps, seq_timeout {}ms)",
@@ -107,7 +138,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    run_live(cfg, doors, fw_kind, mode, shards, rate)
+    run_live(cfg, doors, fw_kind, mode, shards, rate, spa_cfg)
 }
 
 /// Drive the capture → matcher → firewall pipeline against live traffic, using
@@ -125,10 +156,17 @@ fn run_live(
     mode: MatchMode,
     n_shards: usize,
     rate: Option<config::RateSpec>,
+    spa_cfg: Option<config::ResolvedSpa>,
 ) -> Result<()> {
+    // Only watch the SPA port when SPA is actually on: an unused port in the
+    // cBPF filter costs one of a budget of 64 that door sequences also draw on.
+    let spa_ports: Vec<u16> = spa_cfg.iter().map(|s| s.port).collect();
+    // The kernel prefilter drops anything outside this union before userspace
+    // ever sees it, so the SPA port has to be in it or SPA is invisible.
     let ports: Vec<u16> = doors
         .iter()
         .flat_map(|d| d.spec.sequence.iter().map(|p| p.port))
+        .chain(spa_ports.iter().copied())
         .collect();
 
     let firewall = firewall_arc(fw_kind)?;
@@ -142,6 +180,7 @@ fn run_live(
     let mut cap = capture::open_live(
         cfg.interface.clone(),
         &ports,
+        &spa_ports[..],
         Some(stats.clone() as Arc<dyn capture::KernelStatsSink>),
     )?;
 
@@ -168,19 +207,49 @@ fn run_live(
         handles.push(thread::spawn(move || worker.run(rx)));
     }
 
+    // The SPA verifier owns replay state, so exactly one thread holds it.
+    let spa_tx = match &spa_cfg {
+        None => None,
+        Some(sp) => {
+            let verifier = build_spa_verifier(sp).context("loading SPA key material")?;
+            let (tx, rx) = mpsc::channel::<capture::SpaDatagram>();
+            let worker = SpaWorker {
+                verifier,
+                limiter: rate.map(|r| r.build(RATE_LIMIT_MAX_SOURCES)),
+                doors: doors.clone(),
+                firewall: firewall.clone(),
+                stats: stats.clone(),
+            };
+            handles.push(thread::spawn(move || worker.run(rx)));
+            Some(tx)
+        }
+    };
+
     tracing::info!(
         shards = n_shards,
         rate_limited = rate.is_some(),
+        spa = spa_cfg.is_some(),
         "knock-daemon up; capturing live traffic"
     );
 
-    let result = cap.run(&mut |ev| {
-        stats.record_observed();
-        let s = matcher::shard_for(&ev.src, n_shards);
-        // A worker only stops if it panicked; surface that rather than silently
-        // dropping the source's traffic.
-        if senders[s].send(ev).is_err() {
-            tracing::error!(shard = s, "matcher worker stopped; dropping packet");
+    let result = cap.run(&mut |captured| match captured {
+        Captured::Knock(ev) => {
+            stats.record_observed();
+            let s = matcher::shard_for(&ev.src, n_shards);
+            // A worker only stops if it panicked; surface that rather than
+            // silently dropping the source's traffic.
+            if senders[s].send(ev).is_err() {
+                tracing::error!(shard = s, "matcher worker stopped; dropping packet");
+            }
+        }
+        Captured::Spa(datagram) => {
+            // With SPA off, the port is not in the capture filter at all, so
+            // this arm is unreachable rather than merely unused.
+            if let Some(tx) = spa_tx.as_ref() {
+                if tx.send(datagram).is_err() {
+                    tracing::error!("SPA worker stopped; dropping datagram");
+                }
+            }
         }
     });
 
@@ -377,7 +446,11 @@ fn run_demo() -> Result<()> {
     // output was fair: two "accepted" lines prove a door can open, they do not
     // show that the packets were interleaved or that one arrived twice.
     let mut seen_first: Vec<IpAddr> = Vec::new();
-    cap.run(&mut |ev| {
+    cap.run(&mut |captured| {
+        // The replay only ever emits knocks; SPA has no scripted form here.
+        let Captured::Knock(ev) = captured else {
+            return;
+        };
         let step = seq.iter().position(|&p| p == ev.port);
         let dup = step == Some(0) && seen_first.contains(&ev.src);
         if step == Some(0) {
@@ -401,4 +474,157 @@ fn run_demo() -> Result<()> {
          \x20   nothing in its place, so .10 would never have opened. ---"
     );
     Ok(())
+}
+
+/// Build an [`spa::SpaVerifier`] from validated config, loading whatever key
+/// material the operator configured.
+///
+/// Both modes may be on at once: a fleet usually wants public-key mode, but a
+/// PSK is a reasonable way to get started, and refusing the combination would
+/// force an all-or-nothing migration.
+fn build_spa_verifier(sp: &config::ResolvedSpa) -> Result<spa::SpaVerifier> {
+    let mut v = spa::SpaVerifier::new(sp.window_secs, sp.max_replay_entries)
+        .with_durations(sp.default_duration_secs, sp.max_duration_secs)
+        .allow_explicit_addr(sp.allow_explicit_addr);
+
+    if let (Some(pass_path), Some(salt)) = (&sp.passphrase_file, &sp.salt) {
+        let passphrase = spa::keys::load_passphrase(Path::new(pass_path))?;
+        // Argon2id at 64 MiB runs exactly here, once, at startup -- never on the
+        // packet path, where a flood could otherwise force it.
+        let key = spa::crypto::derive_psk(&passphrase, salt.as_bytes())
+            .map_err(|e| anyhow::anyhow!("deriving SPA pre-shared key: {e}"))?;
+        v = v.with_psk(key);
+    }
+
+    if let Some(secret_path) = &sp.static_key_file {
+        let secret = spa::keys::load_static_secret(Path::new(secret_path))?;
+        v = v.with_static_secret(secret);
+        if let Some(auth_path) = &sp.authorized_keys {
+            let keys = spa::keys::load_authorized_keys(Path::new(auth_path))?;
+            if keys.is_empty() {
+                // Not fatal -- the verifier fails closed -- but silence here
+                // would look exactly like a working setup.
+                tracing::warn!(
+                    file = %auth_path,
+                    "SPA authorized_keys is empty; no client can be authorised yet"
+                );
+            }
+            for k in keys {
+                v = v.authorize(k.public);
+            }
+        }
+    }
+    Ok(v)
+}
+
+/// Owns the SPA verifier and turns accepted packets into firewall openings.
+///
+/// One thread, not a shard set: `SpaVerifier::verify` takes `&mut self` because
+/// the replay guard is state, and replay detection is only sound if every packet
+/// is checked against the same guard. Sharding it by source would let the same
+/// packet be accepted once per shard.
+struct SpaWorker {
+    verifier: spa::SpaVerifier,
+    limiter: Option<ratelimit::RateLimiter>,
+    doors: Arc<Vec<ResolvedDoor>>,
+    firewall: Arc<dyn firewall::Firewall + Sync>,
+    stats: Arc<stats::Stats>,
+}
+
+impl SpaWorker {
+    fn run(mut self, rx: mpsc::Receiver<capture::SpaDatagram>) {
+        for dg in rx {
+            self.stats.record_spa_observed();
+
+            // Rate-limit before any cryptography, so an unauthenticated flood
+            // costs us a hash lookup rather than an AEAD open.
+            if let Some(l) = self.limiter.as_mut() {
+                if !l.allow(dg.src, dg.at_ms) {
+                    self.stats.record_rate_limited();
+                    continue;
+                }
+            }
+
+            let verdict = self.verifier.verify(&dg.payload, dg.src, dg.at_unix);
+            // Publish replay-table size after every packet: the claim that memory
+            // tracks the window rather than uptime is only worth making if an
+            // operator can watch it.
+            self.stats
+                .set_spa_replay_tracked(self.verifier.tracked_replays());
+            match verdict {
+                Ok(authorized) => self.apply(&dg, authorized),
+                Err(e) => {
+                    self.stats.record_spa_rejected();
+                    // The reason is logged, never sent: the daemon answers
+                    // nothing, so a prober learns nothing from a refusal.
+                    tracing::debug!(src = %dg.src, error = %e, "SPA packet refused");
+                }
+            }
+        }
+    }
+
+    fn apply(&self, dg: &capture::SpaDatagram, authorized: spa::Authorized) {
+        let Some(idx) = self
+            .doors
+            .iter()
+            .position(|d| d.spec.name == authorized.door)
+        else {
+            // Authenticated, but naming a door this server does not have. Worth a
+            // warning rather than a debug: the packet was legitimate, so this is
+            // a configuration mismatch between client and server, not an attack.
+            self.stats.record_spa_rejected();
+            tracing::warn!(
+                src = %dg.src,
+                door = %authorized.door,
+                "SPA packet authorised but names an unknown door"
+            );
+            return;
+        };
+
+        let door = &self.doors[idx];
+        let who = authorized
+            .client_pub
+            .map(|k| spa::keys::encode_hex32(&k))
+            .unwrap_or_else(|| "psk".to_string());
+
+        match self.firewall.open_for(
+            &door.action,
+            authorized.addr,
+            Some(authorized.duration_secs),
+        ) {
+            Ok(()) => {
+                self.stats.record_spa_accepted();
+                self.stats.record_accepted(idx);
+                tracing::info!(
+                    door = %authorized.door,
+                    addr = %authorized.addr,
+                    // The address the packet arrived at, which on a multi-homed
+                    // host is the only way to tell which service was meant.
+                    via = %dg.dst,
+                    duration_secs = authorized.duration_secs,
+                    identity = %who,
+                    "SPA knock accepted"
+                );
+                // A backend that cannot expire on its own needs the same
+                // userspace close timer a sequence knock gets -- but for the
+                // duration this packet asked for, not the door's default.
+                if !self.firewall.auto_expires() {
+                    let fw = self.firewall.clone();
+                    let mut action = door.action.clone();
+                    action.timeout_ms = Some(u64::from(authorized.duration_secs) * 1000);
+                    let addr = authorized.addr;
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(action.timeout_ms.unwrap_or_default()));
+                        if let Err(e) = fw.close(&action, addr) {
+                            tracing::error!(error = %e, "closing SPA access failed");
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                self.stats.record_spa_rejected();
+                tracing::error!(error = %e, door = %authorized.door, "opening SPA door failed");
+            }
+        }
+    }
 }

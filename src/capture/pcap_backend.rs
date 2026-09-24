@@ -10,22 +10,30 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use pcap::{Capture as PcapHandle, Device};
 
-use crate::matcher::PacketEvent;
-
-use super::{parse, Capture};
+use super::{parse, unix_secs, Capture, Captured};
 
 pub struct PcapCapture {
     interface: Option<String>,
     /// BPF filter to push capture cost into the kernel.
     filter: String,
+    /// UDP ports whose datagrams are decoded as SPA rather than as knocks.
+    spa_ports: Vec<u16>,
     start: Instant,
 }
 
 impl PcapCapture {
-    /// `ports` is the union of every door's ports; we build a BPF filter so the
-    /// kernel only hands us packets that could matter.
-    pub fn new(interface: Option<String>, ports: &[u16]) -> Self {
-        let filter = if ports.is_empty() {
+    /// `ports` is the union of every door's ports and `spa_ports` the SPA
+    /// listeners; we build a BPF filter so the kernel only hands us packets that
+    /// could matter. The SPA term is its own disjunct rather than relying on the
+    /// caller having folded those ports into `ports`: a filter that drops SPA
+    /// in-kernel would be invisible at this layer and look like a client bug.
+    pub fn new(interface: Option<String>, ports: &[u16], spa_ports: &[u16]) -> Self {
+        let mut spa_ports = spa_ports.to_vec();
+        spa_ports.sort_unstable();
+        spa_ports.dedup();
+
+        let knock_term = if ports.is_empty() {
+            // No door ports: take every SYN/UDP, which already covers SPA.
             "tcp[tcpflags] & tcp-syn != 0 or udp".to_string()
         } else {
             let port_list = ports
@@ -35,16 +43,27 @@ impl PcapCapture {
                 .join(" or port ");
             format!("(tcp[tcpflags] & tcp-syn != 0 or udp) and (port {port_list})")
         };
+        let filter = if spa_ports.is_empty() || ports.is_empty() {
+            knock_term
+        } else {
+            let spa_list = spa_ports
+                .iter()
+                .map(|p| format!("udp dst port {p}"))
+                .collect::<Vec<_>>()
+                .join(" or ");
+            format!("({knock_term}) or ({spa_list})")
+        };
         Self {
             interface,
             filter,
+            spa_ports,
             start: Instant::now(),
         }
     }
 }
 
 impl Capture for PcapCapture {
-    fn run(&mut self, sink: &mut dyn FnMut(PacketEvent)) -> Result<()> {
+    fn run(&mut self, sink: &mut dyn FnMut(Captured)) -> Result<()> {
         let device = match &self.interface {
             Some(name) => Device::from(name.as_str()),
             None => Device::lookup()
@@ -63,8 +82,13 @@ impl Capture for PcapCapture {
         loop {
             match cap.next_packet() {
                 Ok(packet) => {
+                    // Both clocks are read once per delivered frame, here, so
+                    // the decoder itself never touches one.
                     let at_ms = self.start.elapsed().as_millis() as u64;
-                    if let Some(ev) = parse::parse_ethernet(packet.data, at_ms) {
+                    let at_unix = unix_secs();
+                    if let Some(ev) =
+                        parse::parse_ethernet(packet.data, at_ms, at_unix, &self.spa_ports)
+                    {
                         sink(ev);
                     }
                 }

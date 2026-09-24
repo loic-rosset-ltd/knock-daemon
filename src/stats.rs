@@ -25,6 +25,10 @@ pub struct Stats {
     packets_observed: AtomicU64,
     packets_rate_limited: AtomicU64,
     knocks_accepted: AtomicU64,
+    spa_observed: AtomicU64,
+    spa_accepted: AtomicU64,
+    spa_rejected: AtomicU64,
+    spa_replay_tracked: AtomicU64,
     /// Cumulative AF_PACKET `tp_packets` — frames that passed the cBPF prefilter
     /// and reached the socket (the kernel's total; per `packet(7)` it includes
     /// any then dropped for a full buffer). Fed by the capture backend via
@@ -51,6 +55,10 @@ impl Stats {
             packets_observed: AtomicU64::new(0),
             packets_rate_limited: AtomicU64::new(0),
             knocks_accepted: AtomicU64::new(0),
+            spa_observed: AtomicU64::new(0),
+            spa_accepted: AtomicU64::new(0),
+            spa_rejected: AtomicU64::new(0),
+            spa_replay_tracked: AtomicU64::new(0),
             kernel_packets: AtomicU64::new(0),
             kernel_drops: AtomicU64::new(0),
             per_door_accepted,
@@ -75,6 +83,32 @@ impl Stats {
         if let Some(c) = self.per_door_accepted.get(door_idx) {
             c.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// An SPA datagram reached the verifier. Counted separately from
+    /// `record_observed`, which means "knock packets seen" and would otherwise
+    /// silently change meaning.
+    pub fn record_spa_observed(&self) {
+        self.spa_observed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_spa_accepted(&self) {
+        self.spa_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One rejected SPA packet. The *reason* goes to the log rather than to a
+    /// label: a per-reason metric would let anyone who can reach `/metrics`
+    /// learn which of their guesses got furthest, which is a scoreboard for an
+    /// attacker.
+    pub fn record_spa_rejected(&self) {
+        self.spa_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current size of the replay table. Exported as a gauge because "memory is
+    /// bounded by the timestamp window, not by uptime" is a design claim, and a
+    /// gauge is how an operator confirms it rather than trusting it.
+    pub fn set_spa_replay_tracked(&self, n: usize) {
+        self.spa_replay_tracked.store(n as u64, Ordering::Relaxed);
     }
 
     /// Fold in a kernel-side capture-stats sample. `packets`/`drops` are the
@@ -105,6 +139,10 @@ impl Stats {
             packets_observed: self.packets_observed.load(Ordering::Relaxed),
             packets_rate_limited: self.packets_rate_limited.load(Ordering::Relaxed),
             knocks_accepted: self.knocks_accepted.load(Ordering::Relaxed),
+            spa_observed: self.spa_observed.load(Ordering::Relaxed),
+            spa_accepted: self.spa_accepted.load(Ordering::Relaxed),
+            spa_rejected: self.spa_rejected.load(Ordering::Relaxed),
+            spa_replay_tracked: self.spa_replay_tracked.load(Ordering::Relaxed),
             kernel_packets: self.kernel_packets.load(Ordering::Relaxed),
             kernel_drops: self.kernel_drops.load(Ordering::Relaxed),
             per_door: self
@@ -129,6 +167,10 @@ pub struct Snapshot {
     pub packets_observed: u64,
     pub packets_rate_limited: u64,
     pub knocks_accepted: u64,
+    pub spa_observed: u64,
+    pub spa_accepted: u64,
+    pub spa_rejected: u64,
+    pub spa_replay_tracked: u64,
     pub kernel_packets: u64,
     pub kernel_drops: u64,
     pub per_door: Vec<(String, u64)>,
@@ -162,6 +204,30 @@ pub fn render(s: &Snapshot) -> String {
         "Completed knock sequences across all doors.",
         s.knocks_accepted,
     );
+    counter(
+        &mut out,
+        "knockd2_spa_observed_total",
+        "SPA datagrams handed to the verifier by the capture layer.",
+        s.spa_observed,
+    );
+    counter(
+        &mut out,
+        "knockd2_spa_accepted_total",
+        "SPA packets that passed every check and opened a door.",
+        s.spa_accepted,
+    );
+    counter(
+        &mut out,
+        "knockd2_spa_rejected_total",
+        "SPA packets refused. Deliberately not broken down by reason: that would tell anyone who can read /metrics which of their guesses got furthest.",
+        s.spa_rejected,
+    );
+    out.push_str("# HELP knockd2_spa_replay_tracked Packet ids currently remembered for replay detection; bounded by the timestamp window, not by uptime.\n");
+    out.push_str("# TYPE knockd2_spa_replay_tracked gauge\n");
+    out.push_str(&format!(
+        "knockd2_spa_replay_tracked {}\n",
+        s.spa_replay_tracked
+    ));
     counter(
         &mut out,
         "knockd2_afpacket_kernel_packets_total",
@@ -302,6 +368,10 @@ mod tests {
         let snap = Snapshot {
             packets_observed: 10,
             packets_rate_limited: 2,
+            spa_observed: 9,
+            spa_accepted: 4,
+            spa_rejected: 5,
+            spa_replay_tracked: 6,
             knocks_accepted: 3,
             kernel_packets: 42,
             kernel_drops: 7,
@@ -316,8 +386,19 @@ mod tests {
         assert!(text.contains("knockd2_afpacket_kernel_drops_total 7"));
         assert!(text.contains("knockd2_door_accepted_total{door=\"ssh\"} 3"));
         assert!(text.contains("knockd2_tracked_sources 1"));
+        assert!(text.contains("knockd2_spa_observed_total 9"));
+        assert!(text.contains("knockd2_spa_accepted_total 4"));
+        assert!(text.contains("knockd2_spa_rejected_total 5"));
+        // SPA counters are separate from the knock ones on purpose: reusing
+        // `packets_observed` would silently change what that metric means.
+        assert!(!text.contains("knockd2_packets_observed_total 19"));
+        // Rejections are a single counter with no reason label -- a per-reason
+        // breakdown would tell a prober which guess got furthest.
+        assert!(!text.contains("knockd2_spa_rejected_total{"));
         // Every metric carries a TYPE line.
-        assert_eq!(text.matches("# TYPE ").count(), 7);
+        assert!(text.contains("knockd2_spa_replay_tracked 6"));
+        assert!(text.contains("# TYPE knockd2_spa_replay_tracked gauge"));
+        assert_eq!(text.matches("# TYPE ").count(), 11);
     }
 
     #[test]
@@ -351,6 +432,10 @@ mod tests {
         let snap = Snapshot {
             packets_observed: 0,
             packets_rate_limited: 0,
+            spa_observed: 0,
+            spa_accepted: 0,
+            spa_rejected: 0,
+            spa_replay_tracked: 0,
             knocks_accepted: 0,
             kernel_packets: 0,
             kernel_drops: 0,

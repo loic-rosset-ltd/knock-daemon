@@ -4,7 +4,7 @@
 
 use crate::matcher::PacketEvent;
 
-use super::Capture;
+use super::{Capture, Captured};
 
 pub struct ReplayCapture {
     events: Vec<PacketEvent>,
@@ -17,9 +17,11 @@ impl ReplayCapture {
 }
 
 impl Capture for ReplayCapture {
-    fn run(&mut self, sink: &mut dyn FnMut(PacketEvent)) -> anyhow::Result<()> {
+    fn run(&mut self, sink: &mut dyn FnMut(Captured)) -> anyhow::Result<()> {
         for ev in &self.events {
-            sink(*ev);
+            // The replay scenario is about knock matching; SPA has no scripted
+            // form here, so every replayed packet is a knock.
+            sink(Captured::Knock(*ev));
         }
         Ok(())
     }

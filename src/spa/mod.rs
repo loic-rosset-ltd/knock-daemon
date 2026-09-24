@@ -37,7 +37,9 @@
 //! Step 2 before step 3 is the property fwknop had to add deliberately as
 //! "HMAC before decryption". With an AEAD it is not a choice, it is the API.
 
+pub mod client;
 pub mod crypto;
+pub mod keys;
 pub mod packet;
 pub mod payload;
 pub mod replay;
@@ -47,7 +49,7 @@ use std::net::IpAddr;
 
 pub use packet::Mode;
 pub use payload::SpaPayload;
-pub use replay::{PacketId, ReplayGuard, ReplayVerdict};
+pub use replay::{ReplayGuard, ReplayVerdict};
 
 /// Every way an SPA packet can be refused.
 ///
@@ -279,17 +281,15 @@ mod tests {
     /// take minutes and would be testing the KDF rather than the verifier.
     fn psk_key() -> crypto::SymKey {
         static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-        let bytes = KEY.get_or_init(|| {
-            *crypto::derive_psk(b"a test passphrase", b"unit-test-salt").unwrap()
-        });
+        let bytes = KEY
+            .get_or_init(|| *crypto::derive_psk(b"a test passphrase", b"unit-test-salt").unwrap());
         zeroize::Zeroizing::new(*bytes)
     }
 
     fn wrong_psk_key() -> crypto::SymKey {
         static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
-        let bytes = KEY.get_or_init(|| {
-            *crypto::derive_psk(b"not the passphrase", b"unit-test-salt").unwrap()
-        });
+        let bytes = KEY
+            .get_or_init(|| *crypto::derive_psk(b"not the passphrase", b"unit-test-salt").unwrap());
         zeroize::Zeroizing::new(*bytes)
     }
 
@@ -398,7 +398,16 @@ mod tests {
         assert!(http.len() > packet::MIN_PACKET_LEN);
         assert_eq!(v.verify(http, src(), NOW), Err(SpaError::BadMagic));
         // A DNS-shaped payload, i.e. plausible real background traffic.
-        assert_eq!(v.verify(&[0x12, 0x34, 0x01, 0x00, 0x00, 0x01][..].repeat(9).as_slice(), src(), NOW), Err(SpaError::BadMagic));
+        assert_eq!(
+            v.verify(
+                [0x12, 0x34, 0x01, 0x00, 0x00, 0x01][..]
+                    .repeat(9)
+                    .as_slice(),
+                src(),
+                NOW
+            ),
+            Err(SpaError::BadMagic)
+        );
     }
 
     // ---- public-key mode -------------------------------------------------
@@ -507,7 +516,10 @@ mod tests {
     #[test]
     fn an_explicit_address_is_ignored_unless_enabled() {
         let claimed: IpAddr = "198.51.100.99".parse().unwrap();
-        let p = SpaPayload { addr: Some(claimed), ..payload(1, NOW) };
+        let p = SpaPayload {
+            addr: Some(claimed),
+            ..payload(1, NOW)
+        };
 
         let mut v = psk_verifier();
         let buf = build_psk(&psk_key(), &p, 1);
@@ -525,11 +537,17 @@ mod tests {
         let buf = build_psk(&psk_key(), &payload(1, NOW), 1);
         assert_eq!(v.verify(&buf, src(), NOW).unwrap().duration_secs, 45);
 
-        let p = SpaPayload { duration_secs: 99_999, ..payload(2, NOW) };
+        let p = SpaPayload {
+            duration_secs: 99_999,
+            ..payload(2, NOW)
+        };
         let buf = build_psk(&psk_key(), &p, 2);
         assert_eq!(v.verify(&buf, src(), NOW).unwrap().duration_secs, 600);
 
-        let p = SpaPayload { duration_secs: 120, ..payload(3, NOW) };
+        let p = SpaPayload {
+            duration_secs: 120,
+            ..payload(3, NOW)
+        };
         let buf = build_psk(&psk_key(), &p, 3);
         assert_eq!(v.verify(&buf, src(), NOW).unwrap().duration_secs, 120);
     }

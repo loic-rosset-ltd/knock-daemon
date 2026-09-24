@@ -79,13 +79,17 @@ pub fn parse_conf(text: &str) -> Result<Config> {
             backend: "command".to_string(),
         },
         // knockd resets on any out-of-order hit; match that for parity. Sharding,
-        // rate limiting, and the stats endpoint are knockd2 extensions with no
-        // legacy equivalent, so they take their native defaults.
+        // rate limiting, the stats endpoint and SPA are knockd2 extensions with
+        // no legacy equivalent, so they take their native defaults — which for
+        // SPA means disabled. A knockd .conf cannot ask for it, and starting a
+        // migrated config with a capability its author never wrote down would be
+        // a surprise, not a favour.
         matching: MatchingConfig {
             mode: "reset".to_string(),
             ..MatchingConfig::default()
         },
         stats: StatsConfig::default(),
+        spa: crate::config::SpaConfig::default(),
         doors,
     })
 }

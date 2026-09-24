@@ -69,6 +69,28 @@ pub trait Firewall: Send {
     fn open(&self, action: &Action, src: IpAddr) -> Result<()>;
     fn close(&self, action: &Action, src: IpAddr) -> Result<()>;
 
+    /// Open access for a caller-supplied duration rather than the door's
+    /// configured one.
+    ///
+    /// A knock sequence carries no duration — the door's `cmd_timeout` is the
+    /// whole story — but an SPA packet *asks* for one, already clamped against
+    /// the door's ceiling by the verifier. The default implementation rewrites
+    /// the action's timeout and delegates, so a backend only overrides this if
+    /// it can do better; nftables does, by handing the per-request timeout
+    /// straight to the kernel.
+    fn open_for(&self, action: &Action, src: IpAddr, duration_secs: Option<u32>) -> Result<()> {
+        match duration_secs {
+            None => self.open(action, src),
+            Some(secs) => {
+                let scoped = Action {
+                    timeout_ms: Some(u64::from(secs) * 1000),
+                    ..action.clone()
+                };
+                self.open(&scoped, src)
+            }
+        }
+    }
+
     /// Whether opened access expires on its own without a userspace close.
     ///
     /// `true` for backends like nftables that hand the timeout to the kernel:

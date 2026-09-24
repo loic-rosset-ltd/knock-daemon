@@ -207,7 +207,12 @@ mod tests {
         assert_eq!(parse(&buf).unwrap().aad, &aad_for(Mode::Psk, None)[..]);
 
         let eph = [5u8; EPH_PUB_LEN];
-        let buf = serialise(Mode::PublicKey, Some(&eph), &[0u8; NONCE_LEN], &[0u8; TAG_LEN]);
+        let buf = serialise(
+            Mode::PublicKey,
+            Some(&eph),
+            &[0u8; NONCE_LEN],
+            &[0u8; TAG_LEN],
+        );
         assert_eq!(
             parse(&buf).unwrap().aad,
             &aad_for(Mode::PublicKey, Some(&eph))[..]
@@ -256,7 +261,12 @@ mod tests {
     #[test]
     fn rejects_public_key_packet_truncated_in_the_ephemeral_key() {
         let eph = [2u8; EPH_PUB_LEN];
-        let buf = serialise(Mode::PublicKey, Some(&eph), &[0u8; NONCE_LEN], &[0u8; TAG_LEN]);
+        let buf = serialise(
+            Mode::PublicKey,
+            Some(&eph),
+            &[0u8; NONCE_LEN],
+            &[0u8; TAG_LEN],
+        );
         for cut in MIN_PACKET_LEN..buf.len() {
             // Never panics, always a clean error.
             let _ = parse(&buf[..cut]);

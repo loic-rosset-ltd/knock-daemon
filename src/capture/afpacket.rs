@@ -34,9 +34,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use crate::matcher::PacketEvent;
-
-use super::{bpf, parse, Capture, KernelStatsSink};
+use super::{bpf, parse, unix_secs, Capture, Captured, KernelStatsSink};
 
 /// EtherType passed to `socket()`; `ETH_P_ALL` delivers every frame.
 const ETH_P_ALL: u16 = 0x0003;
@@ -58,8 +56,11 @@ const _: () = assert!(
 
 pub struct AfPacketCapture {
     interface: Option<String>,
-    /// Sorted union of every door's ports; empty means "accept all".
+    /// Sorted union of every door's ports *and* the SPA ports; empty means
+    /// "accept all". Drives both the kernel prefilter and `accepts` below.
     ports: Vec<u16>,
+    /// Sorted UDP ports whose datagrams are decoded as SPA rather than knocks.
+    spa_ports: Vec<u16>,
     /// Optional sink for kernel-side capture counters (PACKET_STATISTICS).
     kstats: Option<Arc<dyn KernelStatsSink>>,
     start: Instant,
@@ -69,14 +70,23 @@ impl AfPacketCapture {
     pub fn new(
         interface: Option<String>,
         ports: &[u16],
+        spa_ports: &[u16],
         kstats: Option<Arc<dyn KernelStatsSink>>,
     ) -> Self {
+        let mut spa_ports = spa_ports.to_vec();
+        spa_ports.sort_unstable();
+        spa_ports.dedup();
+        // Fold the SPA ports into the filter set here rather than trusting the
+        // caller to have done it: a prefilter that omits them drops SPA in the
+        // kernel, where nothing at this layer could ever observe the loss.
         let mut ports = ports.to_vec();
+        ports.extend_from_slice(&spa_ports);
         ports.sort_unstable();
         ports.dedup();
         Self {
             interface,
             ports,
+            spa_ports,
             kstats,
             start: Instant::now(),
         }
@@ -246,7 +256,7 @@ impl Drop for Socket {
 }
 
 impl Capture for AfPacketCapture {
-    fn run(&mut self, sink: &mut dyn FnMut(PacketEvent)) -> Result<()> {
+    fn run(&mut self, sink: &mut dyn FnMut(Captured)) -> Result<()> {
         // SAFETY: plain socket(2); we check the return value.
         let fd =
             unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, (ETH_P_ALL.to_be()) as i32) };
@@ -307,10 +317,22 @@ impl Capture for AfPacketCapture {
                     _ => return Err(anyhow!(err)).context("recv on AF_PACKET socket"),
                 }
             } else {
+                // Both clocks are read once per recv, not per parsed field; the
+                // decoder takes them as parameters and reads no clock itself.
                 let at_ms = self.start.elapsed().as_millis() as u64;
-                if let Some(ev) = parse::parse_ethernet(&buf[..n as usize], at_ms) {
-                    if self.accepts(ev.port) {
-                        sink(ev);
+                let at_unix = unix_secs();
+                // `buf` is reused by the next recv, so an SPA payload must be
+                // copied out before the sink returns — `parse_ethernet` does
+                // exactly that, which is why `Captured::Spa` owns its bytes.
+                if let Some(ev) =
+                    parse::parse_ethernet(&buf[..n as usize], at_ms, at_unix, &self.spa_ports)
+                {
+                    // An SPA datagram was only decoded because its port is in
+                    // `spa_ports`, which `new` folded into `ports` — so it is
+                    // accepted by construction and needs no second check.
+                    match ev {
+                        Captured::Knock(k) if !self.accepts(k.port) => {}
+                        ev => sink(ev),
                     }
                 }
             }

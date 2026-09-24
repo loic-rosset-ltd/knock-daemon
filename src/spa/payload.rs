@@ -254,7 +254,10 @@ mod tests {
             signature: Some([1u8; 64]),
             ..base()
         };
-        assert_eq!(p.encode().unwrap().len(), p.signed_region().unwrap().len() + 64);
+        assert_eq!(
+            p.encode().unwrap().len(),
+            p.signed_region().unwrap().len() + 64
+        );
     }
 
     /// Truncation at every possible offset must produce an error, never a panic
@@ -288,10 +291,16 @@ mod tests {
 
     #[test]
     fn rejects_empty_oversized_and_non_utf8_door_names() {
-        let p = SpaPayload { door: String::new(), ..base() };
+        let p = SpaPayload {
+            door: String::new(),
+            ..base()
+        };
         assert!(matches!(p.encode(), Err(SpaError::BadDoorName)));
 
-        let p = SpaPayload { door: "x".repeat(MAX_DOOR_LEN + 1), ..base() };
+        let p = SpaPayload {
+            door: "x".repeat(MAX_DOOR_LEN + 1),
+            ..base()
+        };
         assert!(matches!(p.encode(), Err(SpaError::BadDoorName)));
 
         // Hand-build a payload whose door bytes are not valid UTF-8.
